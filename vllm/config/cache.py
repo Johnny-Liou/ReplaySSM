@@ -138,6 +138,12 @@ class CacheConfig:
     - "align": only cache the mamba state of the last token of each scheduler step and
            when the token is at position i * block_size.
     """
+    mamba_max_cache_len: int = Field(default=16, gt=0)
+    """Maximum number of autoregressive Mamba2 decode steps to accumulate in
+    the cached-dot SSM update ring before flushing the checkpoint state."""
+    mamba_use_cached_kernel: bool = False
+    """Use the cached-dot Mamba2 decode SSM update kernel. This is only
+    supported for autoregressive decode with mamba_cache_mode='none'."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)

@@ -74,6 +74,8 @@ class BaseMambaAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+    write_pos_d: torch.Tensor | None = None
+    is_flush_d: torch.Tensor | None = None
 
 
 class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
@@ -98,6 +100,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         self.compilation_config = vllm_config.compilation_config
         self.num_spec_tokens: int = vllm_config.num_speculative_tokens
         self.use_spec_decode = self.num_spec_tokens > 0
+        self.use_cached_kernel = vllm_config.cache_config.mamba_use_cached_kernel
+        self.max_cache_len = vllm_config.cache_config.mamba_max_cache_len
 
         assert isinstance(kv_cache_spec, MambaSpec)
         scheduler_config = vllm_config.scheduler_config
@@ -156,6 +160,17 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             self.decode_num_accepted_tokens: torch.Tensor = torch.empty(
                 (self.decode_cudagraph_max_bs,),
                 dtype=torch.int32,
+                device=device,
+            )
+        if self.use_cached_kernel:
+            self.decode_write_pos_d: torch.Tensor = torch.empty(
+                (self.decode_cudagraph_max_bs,),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.decode_is_flush_d: torch.Tensor = torch.empty(
+                (self.decode_cudagraph_max_bs,),
+                dtype=torch.int8,
                 device=device,
             )
 
@@ -401,6 +416,11 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         has_prior_state = seq_lens_cpu > 1
         prefill_to_decode = single_token_prefill_rows & has_prior_state
         if torch.any(prefill_to_decode).item():
+            if self.use_cached_kernel and metadata.num_decodes > 0:
+                raise ValueError(
+                    "--mamba-use-cached-kernel does not support single-token "
+                    "prefill rows replayed through the decode path"
+                )
             is_prefilling = is_prefilling.clone()
             is_prefilling[prefill_to_decode] = False
             common_attn_metadata = common_attn_metadata.replace(
@@ -431,6 +451,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
 
         # for causal_conv1d
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        write_pos_d = None
+        is_flush_d = None
 
         if self.vllm_config.cache_config.mamba_cache_mode == "all":
             num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
@@ -518,6 +540,46 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     num_reqs - num_prefills : num_reqs
                 ]
 
+        if self.use_cached_kernel and num_decodes > 0:
+            num_prompt_tokens_cpu = common_attn_metadata.num_prompt_tokens_cpu
+            num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
+            if num_prompt_tokens_cpu is None or num_computed_tokens_cpu is None:
+                raise ValueError(
+                    "--mamba-use-cached-kernel requires CPU prompt and "
+                    "computed-token counts to derive decode write positions"
+                )
+            decode_steps_cpu = (
+                num_computed_tokens_cpu[:num_decodes]
+                - num_prompt_tokens_cpu[:num_decodes]
+            )
+            query_lens_cpu = (
+                common_attn_metadata.query_start_loc_cpu[1 : num_decodes + 1]
+                - common_attn_metadata.query_start_loc_cpu[:num_decodes]
+            )
+            valid_decode_rows = query_lens_cpu > 0
+            if torch.any(decode_steps_cpu[valid_decode_rows] < 0).item():
+                raise ValueError(
+                    "--mamba-use-cached-kernel requires decode-step counts "
+                    "that exclude prompt tokens and start at zero"
+                )
+            decode_steps_cpu = torch.where(
+                valid_decode_rows,
+                decode_steps_cpu,
+                torch.zeros_like(decode_steps_cpu),
+            )
+            write_pos_cpu = torch.remainder(decode_steps_cpu, self.max_cache_len)
+            is_flush_cpu = (write_pos_cpu == self.max_cache_len - 1).to(torch.int8)
+            write_pos_d = async_tensor_h2d(
+                write_pos_cpu.to(torch.int32).tolist(),
+                dtype=torch.int32,
+                device=common_attn_metadata.query_start_loc.device,
+            )
+            is_flush_d = async_tensor_h2d(
+                is_flush_cpu.tolist(),
+                dtype=torch.int8,
+                device=common_attn_metadata.query_start_loc.device,
+            )
+
         metadata = self.metadata_cls(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -527,6 +589,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             has_initial_states_p=has_initial_states_p,
             state_indices_tensor_p=state_indices_tensor_p,
             state_indices_tensor_d=state_indices_tensor_d,
+            write_pos_d=write_pos_d,
+            is_flush_d=is_flush_d,
             num_accepted_tokens=num_accepted_tokens,
             query_start_loc_d=query_start_loc_d,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
@@ -561,6 +625,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         block_idx_last_scheduled_token_prev_step = (
             metadata.block_idx_last_scheduled_token_prev_step
         )
+        write_pos_d = metadata.write_pos_d
+        is_flush_d = metadata.is_flush_d
         if (
             metadata.num_prefills == 0
             and metadata.num_decodes <= self.decode_cudagraph_max_bs
@@ -622,11 +688,30 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     )
                     block_idx_last_scheduled_token_prev_step[metadata.num_decodes :] = 0
 
+            if self.use_cached_kernel:
+                assert write_pos_d is not None
+                assert is_flush_d is not None
+                self.decode_write_pos_d[: metadata.num_decodes].copy_(
+                    write_pos_d[: metadata.num_decodes],
+                    non_blocking=True,
+                )
+                write_pos_d = self.decode_write_pos_d[:padded_bs]
+                write_pos_d[metadata.num_decodes :] = 0
+
+                self.decode_is_flush_d[: metadata.num_decodes].copy_(
+                    is_flush_d[: metadata.num_decodes],
+                    non_blocking=True,
+                )
+                is_flush_d = self.decode_is_flush_d[:padded_bs]
+                is_flush_d[metadata.num_decodes :] = 0
+
         return replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
             query_start_loc_d=query_start_loc_d,
             num_accepted_tokens=num_accepted_tokens,
+            write_pos_d=write_pos_d,
+            is_flush_d=is_flush_d,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
             block_idx_last_computed_token=block_idx_last_computed_token,
             block_idx_last_scheduled_token_prev_step=(
