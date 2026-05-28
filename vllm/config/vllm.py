@@ -2128,6 +2128,11 @@ class VllmConfig:
     @model_validator(mode="after")
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
         if not self.cache_config.mamba_use_cached_kernel:
+            if self.cache_config.mamba_cached_kernel_variant != "recurrent":
+                raise ValueError(
+                    "--mamba-cached-kernel-variant is only meaningful when "
+                    "--mamba-use-cached-kernel is enabled"
+                )
             return self
         if self.cache_config.mamba_cache_mode != "none":
             raise ValueError(

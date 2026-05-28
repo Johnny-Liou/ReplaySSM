@@ -76,6 +76,10 @@ class BaseMambaAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
     write_pos_d: torch.Tensor | None = None
     is_flush_d: torch.Tensor | None = None
+    # Shared per-step scratch for the cached-bc (attention_like) variant:
+    # (decode_rows, ngroups, max_cache_len) fp32. None for the recurrent
+    # variant or when the cached kernel is disabled.
+    bc_pre_scratch: torch.Tensor | None = None
 
 
 class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
@@ -173,6 +177,33 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 dtype=torch.int8,
                 device=device,
             )
+            self.cached_kernel_variant: str = (
+                vllm_config.cache_config.mamba_cached_kernel_variant
+            )
+            if self.cached_kernel_variant == "attention_like":
+                # B_cache shape = (ngroups, max_cache_len, dstate). Index in
+                # MambaSpec.shapes is (conv_state, ssm_state, x_cache,
+                # dt_cache, B_cache) when the cached kernel is enabled.
+                if len(kv_cache_spec.shapes) < 5:
+                    raise ValueError(
+                        "cached-bc variant requires the 5-tensor Mamba2 "
+                        "page (conv, ssm, x_cache, dt_cache, B_cache)"
+                    )
+                bc_ngroups = kv_cache_spec.shapes[4][0]
+                self.decode_bc_pre_scratch: torch.Tensor = torch.empty(
+                    (
+                        self.decode_cudagraph_max_bs,
+                        bc_ngroups,
+                        self.max_cache_len,
+                    ),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            else:
+                self.decode_bc_pre_scratch = None
+        else:
+            self.cached_kernel_variant = "recurrent"
+            self.decode_bc_pre_scratch = None
 
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
         if self.use_spec_decode:
@@ -580,6 +611,15 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 device=common_attn_metadata.query_start_loc.device,
             )
 
+        bc_pre_scratch = None
+        if (
+            self.use_cached_kernel
+            and self.cached_kernel_variant == "attention_like"
+            and self.decode_bc_pre_scratch is not None
+            and num_decodes > 0
+        ):
+            bc_pre_scratch = self.decode_bc_pre_scratch[:num_decodes]
+
         metadata = self.metadata_cls(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -591,6 +631,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             state_indices_tensor_d=state_indices_tensor_d,
             write_pos_d=write_pos_d,
             is_flush_d=is_flush_d,
+            bc_pre_scratch=bc_pre_scratch,
             num_accepted_tokens=num_accepted_tokens,
             query_start_loc_d=query_start_loc_d,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
@@ -627,6 +668,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         )
         write_pos_d = metadata.write_pos_d
         is_flush_d = metadata.is_flush_d
+        bc_pre_scratch = metadata.bc_pre_scratch
         if (
             metadata.num_prefills == 0
             and metadata.num_decodes <= self.decode_cudagraph_max_bs
@@ -705,6 +747,12 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 is_flush_d = self.decode_is_flush_d[:padded_bs]
                 is_flush_d[metadata.num_decodes :] = 0
 
+                if (
+                    self.cached_kernel_variant == "attention_like"
+                    and self.decode_bc_pre_scratch is not None
+                ):
+                    bc_pre_scratch = self.decode_bc_pre_scratch[:padded_bs]
+
         return replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
@@ -712,6 +760,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             num_accepted_tokens=num_accepted_tokens,
             write_pos_d=write_pos_d,
             is_flush_d=is_flush_d,
+            bc_pre_scratch=bc_pre_scratch,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
             block_idx_last_computed_token=block_idx_last_computed_token,
             block_idx_last_scheduled_token_prev_step=(

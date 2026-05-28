@@ -38,6 +38,9 @@ from vllm.model_executor.layers.mamba.ops.ssd_combined import (
 from vllm.model_executor.layers.mamba.ops.selective_state_update_cached import (
     selective_state_update_cached,
 )
+from vllm.model_executor.layers.mamba.ops.selective_state_update_cached_bc import (
+    selective_state_update_cached_bc,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import selective_state_update
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
@@ -506,6 +509,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
         self.max_cache_len = (
             cache_config.mamba_max_cache_len if cache_config is not None else 16
+        )
+        self.cached_kernel_variant = (
+            cache_config.mamba_cached_kernel_variant
+            if cache_config is not None
+            else "recurrent"
         )
         if self.use_cache_kernel and self.num_heads % self.tp_size != 0:
             raise ValueError(
@@ -1078,25 +1086,52 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 assert x_cache is not None
                 assert dt_cache is not None
                 assert B_cache is not None
-                selective_state_update_cached(
-                    ssm_state,
-                    hidden_states_d,
-                    dt_d,
-                    A_d,
-                    B_d,
-                    C_d,
-                    D_d,
-                    dt_bias,
-                    dt_softplus=True,
-                    x_cache=x_cache,
-                    dt_cache=dt_cache,
-                    B_cache=B_cache,
-                    write_pos=attn_metadata.write_pos_d,
-                    is_flush=attn_metadata.is_flush_d,
-                    max_cache_len=self.max_cache_len,
-                    state_batch_indices=state_indices_tensor_d_input,
-                    out=preallocated_ssm_out_d,
-                )
+                if self.cached_kernel_variant == "attention_like":
+                    if attn_metadata.bc_pre_scratch is None:
+                        raise ValueError(
+                            "Mamba2 cached-bc decode kernel requires "
+                            "bc_pre_scratch in attention metadata"
+                        )
+                    selective_state_update_cached_bc(
+                        ssm_state,
+                        hidden_states_d,
+                        dt_d,
+                        A_d,
+                        B_d,
+                        C_d,
+                        D_d,
+                        dt_bias,
+                        dt_softplus=True,
+                        x_cache=x_cache,
+                        dt_cache=dt_cache,
+                        B_cache=B_cache,
+                        bc_pre=attn_metadata.bc_pre_scratch,
+                        write_pos=attn_metadata.write_pos_d,
+                        is_flush=attn_metadata.is_flush_d,
+                        max_cache_len=self.max_cache_len,
+                        state_batch_indices=state_indices_tensor_d_input,
+                        out=preallocated_ssm_out_d,
+                    )
+                else:
+                    selective_state_update_cached(
+                        ssm_state,
+                        hidden_states_d,
+                        dt_d,
+                        A_d,
+                        B_d,
+                        C_d,
+                        D_d,
+                        dt_bias,
+                        dt_softplus=True,
+                        x_cache=x_cache,
+                        dt_cache=dt_cache,
+                        B_cache=B_cache,
+                        write_pos=attn_metadata.write_pos_d,
+                        is_flush=attn_metadata.is_flush_d,
+                        max_cache_len=self.max_cache_len,
+                        state_batch_indices=state_indices_tensor_d_input,
+                        out=preallocated_ssm_out_d,
+                    )
             else:
                 selective_state_update(
                     ssm_state,

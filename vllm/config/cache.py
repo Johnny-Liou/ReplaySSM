@@ -34,6 +34,7 @@ CacheDType = Literal[
 ]
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
+MambaCachedKernelVariant = Literal["recurrent", "attention_like"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
@@ -144,6 +145,14 @@ class CacheConfig:
     mamba_use_cached_kernel: bool = False
     """Use the cached-dot Mamba2 decode SSM update kernel. This is only
     supported for autoregressive decode with mamba_cache_mode='none'."""
+    mamba_cached_kernel_variant: MambaCachedKernelVariant = "recurrent"
+    """Variant of the cached Mamba2 decode kernel (only meaningful when
+    mamba_use_cached_kernel is True):
+    - "recurrent" (default): cached-dot. Reconstructs the SSM state every
+       step via tl.dot.
+    - "attention_like": cached-bc. Replaces the per-step tl.dot reconstruction
+       on non-flush steps with a BC-factorized precompute + tl.sum reduction
+       (the new state is only materialized on flush steps)."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
