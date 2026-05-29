@@ -51,8 +51,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         return MambaAttentionBackendEnum.GDN_ATTN
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+        return MambaStateDtypeCalculator.gated_delta_net_cached_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
+            self.cache_config.mamba_use_cached_kernel,
         )
