@@ -105,6 +105,30 @@ class MambaStateDtypeCalculator:
         return conv_dtype, ssm_dtype, activation_dtype, torch.float32, activation_dtype
 
     @classmethod
+    def mamba2_spec_cached_state_dtype(
+        cls,
+        model_dtype: ModelDType | torch.dtype,
+        mamba_cache_dtype: MambaDType,
+        mamba_ssm_cache_dtype: MambaDType,
+        mamba_use_cached_spec_kernel: bool,
+    ) -> tuple[torch.dtype, ...]:
+        """Mamba2 state dtypes for the cached SPECULATIVE-decode (hybrid) kernel.
+
+        Baseline ``(conv, ssm)`` when off; otherwise the hybrid 4-tuple
+        ``(conv, ssm_checkpoint, post_conv_cache, dt_cache)``. The checkpoint
+        and ``dt_cache`` are forced fp32 (the cached-spec reconstruction was
+        validated against an fp32 reference); ``post_conv_cache`` is activation
+        dtype. Must stay in sync with ``MambaMixer2.get_state_dtype``.
+        """
+        conv_dtype, _ssm_dtype = cls.mamba2_state_dtype(
+            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+        )
+        if not mamba_use_cached_spec_kernel:
+            return conv_dtype, _ssm_dtype
+        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+        return conv_dtype, torch.float32, activation_dtype, torch.float32
+
+    @classmethod
     def _mamba_state_dtype(
         cls,
         model_dtype: ModelDType | torch.dtype,
@@ -279,6 +303,60 @@ class MambaStateShapeCalculator:
             x_cache_shape,
             dt_cache_shape,
             B_cache_shape,
+        )
+
+    @classmethod
+    def mamba2_spec_cached_state_shape(
+        cls,
+        tp_world_size: int,
+        intermediate_size: int,
+        n_groups: int,
+        num_heads: int,
+        head_dim: int,
+        state_size: int,
+        conv_kernel: int,
+        mamba_use_cached_spec_kernel: bool,
+        mamba_max_cache_len: int,
+        num_spec: int = 0,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Mamba2 state shapes for the cached SPECULATIVE-decode (hybrid) kernel.
+
+        Baseline ``(conv, ssm)`` when off (conv keeps its spec sliding-window
+        size ``conv_kernel-1+num_spec`` -- the hybrid reuses
+        ``causal_conv1d_update``); otherwise appends the circular caches
+        ``post_conv_cache=(cache_buf_len, conv_dim_local)`` and
+        ``dt_cache=(local_nheads, cache_buf_len)``, where
+        ``cache_buf_len = next_pow2(mamba_max_cache_len)`` and ``conv_dim_local``
+        matches the post-conv x|B|C width. Must stay in sync with
+        ``MambaMixer2.get_state_shape``.
+        """
+        conv_state_shape, temporal_state_shape = cls.mamba2_state_shape(
+            tp_world_size=tp_world_size,
+            intermediate_size=intermediate_size,
+            n_groups=n_groups,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+            num_spec=num_spec,
+        )
+        if not mamba_use_cached_spec_kernel:
+            return conv_state_shape, temporal_state_shape
+        n_groups_ext = n_groups + cls.extra_groups_for_head_shards(
+            n_groups, tp_world_size
+        )
+        conv_dim_local = divide(
+            intermediate_size + 2 * n_groups_ext * state_size, tp_world_size
+        )
+        cache_buf_len = 1 << (mamba_max_cache_len - 1).bit_length()
+        local_nheads = divide(num_heads, tp_world_size)
+        post_conv_cache_shape = (cache_buf_len, conv_dim_local)
+        dt_cache_shape = (local_nheads, cache_buf_len)
+        return (
+            conv_state_shape,
+            temporal_state_shape,
+            post_conv_cache_shape,
+            dt_cache_shape,
         )
 
     @classmethod

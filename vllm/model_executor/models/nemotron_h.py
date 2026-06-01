@@ -817,6 +817,13 @@ class NemotronHForCausalLM(
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, ...]:
         cache_config = vllm_config.cache_config
+        if cache_config.mamba_use_cached_spec_kernel:
+            return MambaStateDtypeCalculator.mamba2_spec_cached_state_dtype(
+                vllm_config.model_config.dtype,
+                cache_config.mamba_cache_dtype,
+                cache_config.mamba_ssm_cache_dtype,
+                mamba_use_cached_spec_kernel=cache_config.mamba_use_cached_spec_kernel,
+            )
         return MambaStateDtypeCalculator.mamba2_cached_state_dtype(
             vllm_config.model_config.dtype,
             cache_config.mamba_cache_dtype,
@@ -846,6 +853,19 @@ class NemotronHForCausalLM(
         hf_config = vllm_config.model_config.hf_config
         intermediate_size = hf_config.mamba_num_heads * hf_config.mamba_head_dim
 
+        if cache_config.mamba_use_cached_spec_kernel:
+            return MambaStateShapeCalculator.mamba2_spec_cached_state_shape(
+                intermediate_size=intermediate_size,
+                tp_world_size=parallel_config.tensor_parallel_size,
+                n_groups=hf_config.n_groups,
+                num_heads=hf_config.mamba_num_heads,
+                head_dim=hf_config.mamba_head_dim,
+                state_size=hf_config.ssm_state_size,
+                conv_kernel=hf_config.conv_kernel,
+                num_spec=vllm_config.num_speculative_tokens,
+                mamba_use_cached_spec_kernel=cache_config.mamba_use_cached_spec_kernel,
+                mamba_max_cache_len=cache_config.mamba_max_cache_len,
+            )
         return MambaStateShapeCalculator.mamba2_cached_state_shape(
             intermediate_size=intermediate_size,
             tp_world_size=parallel_config.tensor_parallel_size,

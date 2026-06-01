@@ -153,6 +153,13 @@ class CacheConfig:
     - "attention_like": cached-bc. Replaces the per-step tl.dot reconstruction
        on non-flush steps with a BC-factorized precompute + tl.sum reduction
        (the new state is only materialized on flush steps)."""
+    mamba_use_cached_spec_kernel: bool = False
+    """Use the cached SPECULATIVE-decode Mamba2 SSM update kernel (circular
+    post-conv cache + truncation). Requires speculative decoding and
+    mamba_cache_mode='none'; reuses vLLM's causal_conv1d_update for the conv
+    (hybrid). Mutually exclusive with mamba_use_cached_kernel. The window cap
+    uses mamba_max_cache_len, which must be a power of two and >= 1 +
+    num_speculative_tokens."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)

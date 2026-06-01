@@ -2153,6 +2153,49 @@ class VllmConfig:
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_mamba_cached_spec_kernel(self) -> "VllmConfig":
+        if not self.cache_config.mamba_use_cached_spec_kernel:
+            return self
+        # Inverted guard: the cached-SPEC kernel *requires* speculative decode
+        # (the opposite of --mamba-use-cached-kernel, which forbids it).
+        if self.cache_config.mamba_use_cached_kernel:
+            raise ValueError(
+                "--mamba-use-cached-spec-kernel is mutually exclusive with "
+                "--mamba-use-cached-kernel (different page shapes / decode paths)"
+            )
+        if self.num_speculative_tokens <= 0:
+            raise ValueError(
+                "--mamba-use-cached-spec-kernel requires speculative decoding "
+                "(num_speculative_tokens > 0)"
+            )
+        if self.cache_config.mamba_cache_mode != "none":
+            raise ValueError(
+                "--mamba-use-cached-spec-kernel requires --mamba-cache-mode none"
+            )
+        if self.mamba_config.backend != MambaBackendEnum.TRITON:
+            raise ValueError(
+                "--mamba-use-cached-spec-kernel requires --mamba-backend triton"
+            )
+        if self.mamba_config.enable_stochastic_rounding:
+            raise ValueError(
+                "--mamba-use-cached-spec-kernel does not support Mamba cache "
+                "stochastic rounding"
+            )
+        max_cache_len = self.cache_config.mamba_max_cache_len
+        max_spec_len = 1 + self.num_speculative_tokens
+        if max_cache_len < max_spec_len:
+            raise ValueError(
+                "--mamba-use-cached-spec-kernel requires --mamba-max-cache-len "
+                f">= 1 + num_speculative_tokens ({max_spec_len}); got {max_cache_len}"
+            )
+        if max_cache_len & (max_cache_len - 1) != 0:
+            raise ValueError(
+                "--mamba-use-cached-spec-kernel requires --mamba-max-cache-len to "
+                f"be a power of two (circular-cache bitmask index); got {max_cache_len}"
+            )
+        return self
+
 
 _current_vllm_config: VllmConfig | None = None
 _current_prefix: str | None = None

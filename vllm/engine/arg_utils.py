@@ -678,6 +678,7 @@ class EngineArgs:
     mamba_max_cache_len: int = CacheConfig.mamba_max_cache_len
     mamba_use_cached_kernel: bool = CacheConfig.mamba_use_cached_kernel
     mamba_cached_kernel_variant: str = CacheConfig.mamba_cached_kernel_variant
+    mamba_use_cached_spec_kernel: bool = CacheConfig.mamba_use_cached_spec_kernel
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     enable_mamba_cache_stochastic_rounding: bool = (
@@ -1168,6 +1169,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--mamba-cached-kernel-variant",
             **cache_kwargs["mamba_cached_kernel_variant"],
+        )
+        cache_group.add_argument(
+            "--mamba-use-cached-spec-kernel",
+            **cache_kwargs["mamba_use_cached_spec_kernel"],
         )
         cache_group.add_argument(
             "--kv-offloading-size", **cache_kwargs["kv_offloading_size"]
@@ -1784,6 +1789,7 @@ class EngineArgs:
             mamba_max_cache_len=self.mamba_max_cache_len,
             mamba_use_cached_kernel=self.mamba_use_cached_kernel,
             mamba_cached_kernel_variant=self.mamba_cached_kernel_variant,
+            mamba_use_cached_spec_kernel=self.mamba_use_cached_spec_kernel,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )

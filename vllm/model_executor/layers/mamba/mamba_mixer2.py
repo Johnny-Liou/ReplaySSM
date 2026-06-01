@@ -41,6 +41,9 @@ from vllm.model_executor.layers.mamba.ops.selective_state_update_cached import (
 from vllm.model_executor.layers.mamba.ops.selective_state_update_cached_bc import (
     selective_state_update_cached_bc,
 )
+from vllm.model_executor.layers.mamba.ops.selective_state_update_spec_cached import (
+    selective_state_update_spec_cache,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import selective_state_update
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
@@ -515,18 +518,31 @@ class MambaMixer2(MambaBase, PluggableLayer):
             if cache_config is not None
             else "recurrent"
         )
-        if self.use_cache_kernel and self.num_heads % self.tp_size != 0:
+        self.use_cache_spec_kernel = (
+            cache_config.mamba_use_cached_spec_kernel
+            if cache_config is not None
+            else False
+        )
+        if (
+            self.use_cache_kernel or self.use_cache_spec_kernel
+        ) and self.num_heads % self.tp_size != 0:
             raise ValueError(
                 "Mamba2 cached decode kernel requires tensor-parallel heads "
                 "to divide evenly"
             )
-        # The tuple is (conv_state, ssm_state) or, with cached decode enabled,
-        # (conv_state, ssm_state, x_cache, dt_cache, B_cache).
-        self.kv_cache = tuple(
-            torch.tensor([]) for _ in range(5 if self.use_cache_kernel else 2)
-        )
+        # The tuple is (conv_state, ssm_state); with cached-dot/bc decode enabled
+        # (conv_state, ssm_state, x_cache, dt_cache, B_cache); with cached-spec
+        # (hybrid) enabled (conv_state, ssm_state, post_conv_cache, dt_cache).
+        if self.use_cache_spec_kernel:
+            _n_state = 4
+        elif self.use_cache_kernel:
+            _n_state = 5
+        else:
+            _n_state = 2
+        self.kv_cache = tuple(torch.tensor([]) for _ in range(_n_state))
 
         self.num_spec = vllm_config.num_speculative_tokens
+        self.max_spec_len = 1 + self.num_spec
         if self.num_spec > 0:
             self.register_buffer(
                 "_decode_state_offsets",
@@ -727,7 +743,16 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 else self.kv_cache[0].transpose(-1, -2)
             )
             ssm_state = self.kv_cache[1]
-            if self.use_cache_kernel:
+            spec_post_conv_cache = spec_dt_cache = None
+            if self.use_cache_spec_kernel:
+                if len(self.kv_cache) != 4:
+                    raise ValueError(
+                        "Mamba2 cached-spec decode kernel requires four Mamba "
+                        "state tensors (conv, ssm, post_conv_cache, dt_cache)"
+                    )
+                spec_post_conv_cache, spec_dt_cache = self.kv_cache[2:]
+                x_cache = dt_cache = B_cache = None
+            elif self.use_cache_kernel:
                 if len(self.kv_cache) != 5:
                     raise ValueError(
                         "Mamba2 cached decode kernel requires five Mamba "
@@ -1036,6 +1061,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 max_query_len=state_indices_tensor_d.size(-1),
             )
 
+            # cached-spec (hybrid) feeds the full channel-last post-conv output
+            # ([num_decode_tokens, conv_dim]) straight to the SSM scatter (no
+            # split) and uses the raw (unexpanded) dt. Capture before reuse.
+            conv_out_spec = hidden_states_B_C_d
+            dt_d_raw = dt_d
+
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d
             )
@@ -1064,7 +1095,51 @@ class MambaMixer2(MambaBase, PluggableLayer):
             preallocated_ssm_out_d = preallocated_ssm_out_d.view(
                 num_decode_tokens, -1, self.head_dim
             )
-            if self.use_cache_kernel:
+            if (
+                self.use_cache_spec_kernel
+                and attn_metadata.spec_write_pos_d is not None
+            ):
+                # Fires only on speculative-verify batches (spec cursors set in
+                # build()). Rare non-spec decode rows under the spec flag (e.g. a
+                # single-token prefill chunk replayed as decode) have no cursors
+                # and fall through to the baseline update below.
+                if is_mamba_cache_all:
+                    raise ValueError(
+                        "Mamba2 cached-spec decode kernel requires "
+                        "mamba_cache_mode='none'"
+                    )
+                assert spec_post_conv_cache is not None
+                assert spec_dt_cache is not None
+                assert query_start_loc_d is not None
+                # Hybrid: causal_conv1d_update (above) already produced conv_out;
+                # feed it + raw dt + the prepared A/D/dt_bias to the circular
+                # scatter+scan. Cursors are block-keyed (advanced once per step
+                # by the commit in build()). out is the packed preallocated buf.
+                selective_state_update_spec_cache(
+                    ssm_state,
+                    spec_post_conv_cache,
+                    spec_dt_cache,
+                    conv_out_spec,
+                    dt_d_raw,
+                    A_d,
+                    write_pos=attn_metadata.spec_write_pos_d,
+                    post_conv_state_pos=attn_metadata.spec_post_origin_d,
+                    is_flush=attn_metadata.spec_is_flush_d,
+                    query_start_loc=query_start_loc_d,
+                    state_batch_indices=state_indices_tensor_d[:, 0],
+                    max_cache_len=self.max_cache_len,
+                    max_spec_len=self.max_spec_len,
+                    d_inner=self.intermediate_size // self.tp_size,
+                    ngroups=self.n_groups // self.tp_size,
+                    dstate=self.ssm_state_size,
+                    D=D_d,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    out=preallocated_ssm_out_d,
+                    cb_pre=attn_metadata.spec_cb_pre_scratch,
+                )
+            elif self.use_cache_kernel:
                 if is_mamba_cache_all:
                     raise ValueError(
                         "Mamba2 cached decode kernel requires "
@@ -1154,6 +1229,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None
         assert self.cache_config is not None
+        if self.use_cache_spec_kernel:
+            return MambaStateDtypeCalculator.mamba2_spec_cached_state_dtype(
+                self.model_config.dtype,
+                self.cache_config.mamba_cache_dtype,
+                self.cache_config.mamba_ssm_cache_dtype,
+                mamba_use_cached_spec_kernel=self.use_cache_spec_kernel,
+            )
         return MambaStateDtypeCalculator.mamba2_cached_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
@@ -1162,6 +1244,19 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        if self.use_cache_spec_kernel:
+            return MambaStateShapeCalculator.mamba2_spec_cached_state_shape(
+                intermediate_size=self.intermediate_size,
+                tp_world_size=get_tensor_model_parallel_world_size(),
+                n_groups=self.n_groups,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                state_size=self.ssm_state_size,
+                conv_kernel=self.conv_kernel_size,
+                num_spec=self.num_spec,
+                mamba_use_cached_spec_kernel=self.use_cache_spec_kernel,
+                mamba_max_cache_len=self.max_cache_len,
+            )
         return MambaStateShapeCalculator.mamba2_cached_state_shape(
             intermediate_size=self.intermediate_size,
             tp_world_size=get_tensor_model_parallel_world_size(),
