@@ -679,6 +679,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, ...]:
+        if vllm_config.cache_config.mamba_use_cached_spec_kernel:
+            return MambaStateDtypeCalculator.gated_delta_net_spec_cached_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+                vllm_config.cache_config.mamba_use_cached_spec_kernel,
+            )
         return MambaStateDtypeCalculator.gated_delta_net_cached_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
@@ -698,6 +705,18 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             if vllm_config.speculative_config
             else 0
         )
+        if vllm_config.cache_config.mamba_use_cached_spec_kernel:
+            return MambaStateShapeCalculator.gated_delta_net_spec_cached_state_shape(
+                tp_size,
+                hf_config.linear_num_key_heads,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
+                hf_config.linear_conv_kernel_dim,
+                vllm_config.cache_config.mamba_use_cached_spec_kernel,
+                vllm_config.cache_config.mamba_max_cache_len,
+                num_spec,
+            )
         return MambaStateShapeCalculator.gated_delta_net_cached_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,

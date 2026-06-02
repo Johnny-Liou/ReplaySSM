@@ -422,6 +422,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], ...]:
+        if self.cache_config.mamba_use_cached_spec_kernel:
+            return MambaStateShapeCalculator.gated_delta_net_spec_cached_state_shape(
+                self.tp_size,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                self.conv_kernel_size,
+                self.cache_config.mamba_use_cached_spec_kernel,
+                self.cache_config.mamba_max_cache_len,
+                self.num_spec,
+            )
         return MambaStateShapeCalculator.gated_delta_net_cached_state_shape(
             self.tp_size,
             self.num_k_heads,
@@ -566,6 +578,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # decodes through fused_recurrent_gated_delta_rule_cached_decode.
         self.use_cache_kernel = self.cache_config.mamba_use_cached_kernel
         self.max_cache_len = self.cache_config.mamba_max_cache_len
+        # Cached-SPEC decode kernel (gdn_spec_cached_decode); see
+        # implementation_markdown/CACHED_SPEC_GDN_INTEGRATION.md. When enabled,
+        # the GDN page grows to the same 5-tuple (fp32 checkpoint) and the spec
+        # verify path decodes through the circular cached kernel.
+        self.use_cache_spec_kernel = (
+            self.cache_config.mamba_use_cached_spec_kernel
+        )
+        self.max_spec_len = 1 + self.num_spec
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1412,7 +1432,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        # The cached-spec kernel consumes the post-conv packed ``mixed_qkv_spec``
+        # directly, so the split/contiguous rearrange into q/k/v (3 cat copies) is
+        # pure waste on that path -- skip it to remove GPU work (and the eager
+        # CPU-dispatch bubble) between the conv and the SSM kernel.
+        if spec_sequence_masks is not None and self.use_cache_spec_kernel:
+            query_spec, key_spec, value_spec = None, None, None
+        else:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
+                mixed_qkv_spec
+            )
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
@@ -1457,7 +1486,57 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and self.use_cache_spec_kernel:
+            # Cached circular spec verify: reuse the post-conv packed
+            # ``mixed_qkv_spec`` (q|k|v) + raw ``a``/``b`` (read per-request via
+            # spec_query_start_loc, same as the baseline kernel). The d/k/g ring
+            # caches + fp32 checkpoint live in the grown 5-tuple page; cursors
+            # are block-keyed in the metadata. See CACHED_SPEC_GDN_INTEGRATION.md.
+            from vllm.model_executor.layers.fla.ops.gdn_spec_cached_decode import (
+                gdn_spec_cached_decode,
+            )
+
+            assert mixed_qkv_spec is not None
+            num_spec_decodes = attn_metadata.num_spec_decodes
+            d_cache = self_kv_cache[2]
+            k_cache = self_kv_cache[3]
+            g_cache = self_kv_cache[4]
+            total_spec = mixed_qkv_spec.shape[0]
+            cs_out = torch.empty(
+                total_spec,
+                self.num_v_heads // self.tp_size,
+                self.head_v_dim,
+                dtype=mixed_qkv_spec.dtype,
+                device=mixed_qkv_spec.device,
+            )
+            gdn_spec_cached_decode(
+                mixed_qkv=mixed_qkv_spec,
+                a=a,
+                b=b,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                checkpoint_state=ssm_state,
+                d_cache=d_cache,
+                k_cache=k_cache,
+                g_cache=g_cache,
+                out=cs_out,
+                query_start_loc=spec_query_start_loc[  # type: ignore[index]
+                    : num_spec_decodes + 1
+                ],
+                ssm_state_indices=spec_state_indices_tensor[  # type: ignore[index]
+                    :num_spec_decodes, 0
+                ],
+                write_pos=attn_metadata.spec_write_pos_d,
+                cache_base=attn_metadata.spec_cache_base_d,
+                is_flush=attn_metadata.spec_is_flush_d,
+                max_cache_len=self.max_cache_len,
+                max_spec_len=self.max_spec_len,
+                scale=self.head_k_dim**-0.5,
+                use_qk_l2norm_in_kernel=True,
+            )
+            core_attn_out_spec = cs_out.unsqueeze(0)
+            last_recurrent_state = None
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,

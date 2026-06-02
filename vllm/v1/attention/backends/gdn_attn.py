@@ -69,6 +69,14 @@ class GDNAttentionMetadata:
     # shape: [num_decodes]; None unless mamba_use_cached_kernel is enabled.
     write_pos_d: torch.Tensor | None = None
 
+    # Cached-SPEC decode cursors: persistent, block-keyed (full (num_blocks,)
+    # fixed-address buffers indexed by spec_state_indices_tensor[:, 0]), advanced
+    # once per step by commit_gdn_spec_cached. None unless
+    # mamba_use_cached_spec_kernel is enabled. See CACHED_SPEC_GDN_INTEGRATION.md.
+    spec_write_pos_d: torch.Tensor | None = None
+    spec_cache_base_d: torch.Tensor | None = None
+    spec_is_flush_d: torch.Tensor | None = None
+
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
@@ -179,6 +187,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 dtype=torch.int32,
                 device=device,
             )
+
+        # Cached-SPEC decode: block-keyed cursors (sized num_gpu_blocks),
+        # allocated lazily on first build (num_gpu_blocks is unknown here), and
+        # advanced once per step by commit_gdn_spec_cached. See
+        # implementation_markdown/CACHED_SPEC_GDN_INTEGRATION.md.
+        self.use_cache_spec_kernel: bool = (
+            vllm_config.cache_config.mamba_use_cached_spec_kernel
+        )
+        self.max_spec_len: int = 1 + self.num_spec
+        self.cursor_device = device
+        self.spec_write_pos: torch.Tensor | None = None
+        self.spec_cache_base: torch.Tensor | None = None
+        self.spec_is_flush: torch.Tensor | None = None
 
     def build(  # type: ignore[override]
         self,
@@ -400,6 +421,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # (write_pos = decode_step % max_cache_len). Only the non-spec decode
         # path runs the cached kernel; see CACHED_GDN_INTEGRATION.md.
         write_pos_d = None
+        spec_write_pos_d = None
+        spec_cache_base_d = None
+        spec_is_flush_d = None
         if self.use_cached_kernel and spec_sequence_masks is None and num_decodes > 0:
             num_prompt_tokens_cpu = m.num_prompt_tokens_cpu
             num_computed_tokens_cpu = m._num_computed_tokens_cpu
@@ -433,6 +457,80 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 dtype=torch.int32,
                 device=query_start_loc.device,
             )
+
+        # Cached-SPEC decode: advance the block-keyed cursors once per step
+        # (commit-at-start, using the previous step's num_accepted), then reset
+        # first-decode rows. Runs on the UNPADDED spec tensors (block-keyed
+        # cursors are skipped for null blocks, so cudagraph padding is fine).
+        # The commit/reset run in build() (eager, not in the captured region);
+        # the cursors are full (num_gpu_blocks,) fixed-address buffers read by
+        # the captured verify kernel. See CACHED_SPEC_GDN_INTEGRATION.md §4.4.
+        if self.use_cache_spec_kernel and num_spec_decodes > 0:
+            from vllm.model_executor.layers.fla.ops.gdn_spec_cached_decode import (
+                commit_gdn_spec_cached,
+                reset_gdn_spec_cursors,
+            )
+
+            assert spec_state_indices_tensor is not None
+            assert num_accepted_tokens is not None
+            if self.spec_write_pos is None:
+                n_blocks = self.vllm_config.cache_config.num_gpu_blocks
+                assert n_blocks is not None and n_blocks > 0, (
+                    "--mamba-use-cached-spec-kernel needs num_gpu_blocks at "
+                    "build time to size the block-keyed cursor buffers"
+                )
+                self.spec_write_pos = torch.zeros(
+                    n_blocks, dtype=torch.int32, device=self.cursor_device
+                )
+                self.spec_cache_base = torch.zeros(
+                    n_blocks, dtype=torch.int32, device=self.cursor_device
+                )
+                self.spec_is_flush = torch.zeros(
+                    n_blocks, dtype=torch.int8, device=self.cursor_device
+                )
+            sbi = spec_state_indices_tensor[:, 0]
+            commit_gdn_spec_cached(
+                self.spec_write_pos,
+                self.spec_cache_base,
+                self.spec_is_flush,
+                num_accepted_tokens.to(torch.int32),
+                sbi,
+                max_cache_len=self.max_cache_len,
+                max_spec_len=self.max_spec_len,
+                cache_buf_len=self.max_cache_len,
+            )
+            # prefill->decode reset for first-decode rows (cursors only; conv
+            # context lives in conv_state). A request's first spec verify has
+            # num_computed_tokens == num_prompt_tokens; that resets its (possibly
+            # recycled) block's cursors to write_pos=0.
+            #
+            # Computed fully on-device to stay sync-free (the spec builder avoids
+            # D->H syncs for async scheduling): `context_lens_tensor` is the
+            # device num_computed_tokens already computed at the top of build();
+            # num_prompt is copied H->D (non-blocking, not a sync). Note
+            # m._num_computed_tokens_cpu is None on the spec path, so we must not
+            # rely on it. The commit/reset run here in build() (eager, outside any
+            # CUDA-graph captured region); the captured verify kernel only reads
+            # the persistent fixed-address cursor buffers.
+            num_prompt_tokens_cpu = m.num_prompt_tokens_cpu
+            if num_prompt_tokens_cpu is not None:
+                num_prompt_d = num_prompt_tokens_cpu.to(
+                    context_lens_tensor.device, non_blocking=True
+                )
+                first_decode_full = context_lens_tensor == num_prompt_d
+                first_decode_d = first_decode_full[spec_sequence_masks].to(torch.int8)
+                reset_gdn_spec_cursors(
+                    self.spec_write_pos,
+                    self.spec_cache_base,
+                    self.spec_is_flush,
+                    first_decode_d,
+                    sbi,
+                    max_cache_len=self.max_cache_len,
+                    max_spec_len=self.max_spec_len,
+                )
+            spec_write_pos_d = self.spec_write_pos
+            spec_cache_base_d = self.spec_cache_base
+            spec_is_flush_d = self.spec_is_flush
 
         # Prepare tensors for cudagraph
         # Note: m.num_actual_tokens is already padded by the model runner for CUDAGraph
@@ -535,6 +633,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
             write_pos_d=write_pos_d,
+            spec_write_pos_d=spec_write_pos_d,
+            spec_cache_base_d=spec_cache_base_d,
+            spec_is_flush_d=spec_is_flush_d,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,

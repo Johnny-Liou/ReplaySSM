@@ -187,6 +187,36 @@ class MambaStateDtypeCalculator:
         return conv_dtype, ssm_dtype, activation_dtype, activation_dtype, torch.float32
 
     @classmethod
+    def gated_delta_net_spec_cached_state_dtype(
+        cls,
+        model_dtype: ModelDType | torch.dtype,
+        mamba_cache_dtype: MambaDType,
+        mamba_ssm_cache_dtype: MambaDType,
+        mamba_use_cached_spec_kernel: bool,
+    ) -> tuple[torch.dtype, ...]:
+        """GDN state dtypes for the cached SPECULATIVE-decode kernel.
+
+        Same ``d/k/g`` ring page as the non-spec cached path, but the ``ssm``
+        checkpoint is forced to ``float32``: the circular spec kernel
+        reconstructs the committed-history state over a full window, which is
+        precision-sensitive (the FlashMamba reference validated an fp32
+        checkpoint). Returns the baseline ``(conv, ssm)`` when the flag is off.
+        """
+        conv_dtype, ssm_dtype = cls._mamba_state_dtype(
+            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+        )
+        if not mamba_use_cached_spec_kernel:
+            return conv_dtype, ssm_dtype
+        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+        return (
+            conv_dtype,
+            torch.float32,  # fp32 checkpoint
+            activation_dtype,  # d_cache
+            activation_dtype,  # k_cache
+            torch.float32,  # g_cache
+        )
+
+    @classmethod
     def kda_state_dtype(
         cls,
         model_dtype: ModelDType | torch.dtype,
@@ -450,6 +480,39 @@ class MambaStateShapeCalculator:
             d_cache_shape,
             k_cache_shape,
             g_cache_shape,
+        )
+
+    @classmethod
+    def gated_delta_net_spec_cached_state_shape(
+        cls,
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        conv_kernel_size: int,
+        mamba_use_cached_spec_kernel: bool,
+        mamba_max_cache_len: int,
+        num_spec: int = 0,
+    ) -> tuple[tuple[int, ...], ...]:
+        """GDN state shapes for the cached SPECULATIVE-decode kernel.
+
+        Identical page to the non-spec cached path -- the circular spec kernel
+        reuses ``d_cache``/``k_cache``/``g_cache`` plus the (fp32) ``ssm``
+        checkpoint. Returns the baseline ``(conv, ssm)`` shapes when the flag is
+        off. The block-keyed cursors (``write_pos``/``cache_base``/``is_flush``)
+        live in the GDN metadata builder, not the paged page.
+        """
+        return cls.gated_delta_net_cached_state_shape(
+            tp_world_size,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_kernel_size,
+            mamba_use_cached_spec_kernel,
+            mamba_max_cache_len,
+            num_spec,
         )
 
     @classmethod
