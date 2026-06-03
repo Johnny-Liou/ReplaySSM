@@ -1395,7 +1395,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # Spec verify window = 1 + num_spec. Use the constant rather than
+                # the block-table width so the cached-spec path can request num_speculative_blocks=0 
+                max_query_len=self.max_spec_len,
                 validate_data=False,
             )
 

@@ -464,7 +464,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # cursors are skipped for null blocks, so cudagraph padding is fine).
         # The commit/reset run in build() (eager, not in the captured region);
         # the cursors are full (num_gpu_blocks,) fixed-address buffers read by
-        # the captured verify kernel. See CACHED_SPEC_GDN_INTEGRATION.md §4.4.
+        # the captured verify kernel.
         if self.use_cache_spec_kernel and num_spec_decodes > 0:
             from vllm.model_executor.layers.fla.ops.gdn_spec_cached_decode import (
                 commit_gdn_spec_cached,
@@ -503,22 +503,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             # context lives in conv_state). A request's first spec verify has
             # num_computed_tokens == num_prompt_tokens; that resets its (possibly
             # recycled) block's cursors to write_pos=0.
-            #
-            # Computed fully on-device to stay sync-free (the spec builder avoids
-            # D->H syncs for async scheduling): `context_lens_tensor` is the
-            # device num_computed_tokens already computed at the top of build();
-            # num_prompt is copied H->D (non-blocking, not a sync). Note
-            # m._num_computed_tokens_cpu is None on the spec path, so we must not
-            # rely on it. The commit/reset run here in build() (eager, outside any
-            # CUDA-graph captured region); the captured verify kernel only reads
-            # the persistent fixed-address cursor buffers.
             num_prompt_tokens_cpu = m.num_prompt_tokens_cpu
             if num_prompt_tokens_cpu is not None:
                 num_prompt_d = num_prompt_tokens_cpu.to(
                     context_lens_tensor.device, non_blocking=True
                 )
-                first_decode_full = context_lens_tensor == num_prompt_d
-                first_decode_d = first_decode_full[spec_sequence_masks].to(torch.int8)
+                first_decode_full = (context_lens_tensor == num_prompt_d).to(
+                    torch.int8
+                )
+                spec_row_idx = (
+                    spec_sequence_masks_cpu.nonzero(as_tuple=True)[0]
+                    .to(query_start_loc.device, non_blocking=True)
+                )
+                first_decode_d = first_decode_full.index_select(0, spec_row_idx)
                 reset_gdn_spec_cursors(
                     self.spec_write_pos,
                     self.spec_cache_base,
