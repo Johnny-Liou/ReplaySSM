@@ -412,7 +412,7 @@ def _get_cached_bc_launch_config(dstate: int) -> tuple[int, int]:
     if dstate <= 64:
         return 32, 4
     if dstate <= 128:
-        return 32, 2
+        return 16, 1
     return 16, 8
 
 
