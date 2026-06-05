@@ -516,11 +516,18 @@ def _advance_write_pos_origin_kernel(
         write_pos,
         tl.where(is_flush_cur != 0, total_commit, write_pos + total_commit),
     ).to(tl.int32)
-    # Flush margin = MAX_SPEC_LEN (FlashMamba's cadence -> full amortization). The
-    # in-kernel TRUNCATION (not this margin) is what prevents buffer overflow, so
-    # write_pos may grow to max_cache_len-1 before a flush; the verify window is
-    # clamped to fit on those steps.
-    next_is_flush = ((new_wp + MAX_SPEC_LEN) >= MAX_CACHE_LEN).to(tl.int8)
+    # EARLY-FLUSH (margin = 2 * MAX_SPEC_LEN): flush one window early so that on
+    # EVERY verify step write_pos + spec_len <= max_cache_len, i.e. the whole
+    # 1+num_spec window always fits and every output position is written. The
+    # in-kernel truncation cap then never binds (it stays as dead safety). This
+    # is required for e2e correctness: with the smaller MAX_SPEC_LEN margin the
+    # window is truncated on near-full-cache flush steps, leaving the tail output
+    # positions UNWRITTEN in the preallocated `out`, and the rejection sampler
+    # (unaware of the truncation) then accepts garbage logits -> corrupted text +
+    # acceptance collapse. Usable committed history becomes max_cache_len -
+    # 2*max_spec_len; raise mamba_max_cache_len for more. (Mirrors the GDN
+    # cached-spec fix; see CACHED_SPEC_GDN_INTEGRATION.md §10.3.)
+    next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) >= MAX_CACHE_LEN).to(tl.int8)
     tl.store(post_origin_ptr + blk, new_origin, mask=valid)
     tl.store(write_pos_ptr + blk, new_wp, mask=valid)
     tl.store(is_flush_ptr + blk, next_is_flush, mask=valid)
@@ -837,7 +844,9 @@ def reset_spec_cursors(
     Hybrid: cursors only -- no pre_conv_cache seed (conv_state carries context)."""
     batch = state_batch_indices.shape[0]
     BLOCK = max(1, triton.next_power_of_2(batch))
-    init_is_flush = 1 if max_spec_len >= max_cache_len else 0
+    # Early-flush margin (2 * max_spec_len): match _advance_write_pos_origin_kernel
+    # so the first decode after prefill agrees with the steady-state flush cadence.
+    init_is_flush = 1 if 2 * max_spec_len >= max_cache_len else 0
     with torch.cuda.device(write_pos.device.index):
         _reset_spec_cursors_kernel[(1,)](
             write_pos,

@@ -237,9 +237,20 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             d_inner_local = local_nheads * head_dim
             ngroups_local = (conv_dim_local - d_inner_local) // (2 * dstate)
             block_spec = 1 << (max(1, self.max_spec_len) - 1).bit_length()
+            # This is a PER-STEP scratch consumed by the scatter on every decode
+            # step (eager AND cudagraph), indexed by pid_b in [0, num_decodes).
+            # It must therefore cover the max decode batch (max_num_seqs), NOT
+            # decode_cudagraph_max_bs -- the latter is 0 under enforce_eager
+            # (max_cudagraph_capture_size=0), which would make this scratch empty
+            # and the scatter write cb_pre[pid_b] out of bounds (IMA). Sizing by
+            # max_num_seqs is CUDA-graph safe: the captured [:num_decodes] slice
+            # shares the same (offset-0) base pointer and row strides.
+            spec_scratch_bs = max(
+                self.decode_cudagraph_max_bs, scheduler_config.max_num_seqs
+            )
             self.decode_spec_cb_pre = torch.empty(
                 (
-                    self.decode_cudagraph_max_bs,
+                    spec_scratch_bs,
                     ngroups_local,
                     self.max_cache_len,
                     block_spec,
@@ -710,23 +721,27 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 cache_buf_len=self.max_cache_len,
             )
             # prefill->decode reset for first-decode rows (cursors only; no conv
-            # seed -- conv_state carries context). Skipped if the CPU token
-            # counts are unavailable (e.g. during CUDA-graph dummy capture).
+            # seed -- conv_state carries context). A request's first spec verify
+            # has num_computed_tokens == num_prompt_tokens; that resets its
+            # (possibly recycled) block's cursors to write_pos=0, and -- because
+            # the commit above runs BEFORE this reset -- also undoes any write_pos
+            # the first-decode commit advanced from the freshly-zeroed cursor.
+            # Derive the mask from the DEVICE-side compute_num_computed_tokens()
+            # (always populated), NOT _num_computed_tokens_cpu, which is None on
+            # the spec verify path -> the old guard silently skipped the reset,
+            # leaving recycled blocks with stale cursors and fresh blocks with a
+            # wrong first-decode write_pos (coherent-but-divergent output +
+            # acceptance drop). Mirrors the GDN fix; see
+            # CACHED_SPEC_GDN_INTEGRATION.md §10.2.
             num_prompt_tokens_cpu = common_attn_metadata.num_prompt_tokens_cpu
-            num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
-            if (
-                num_prompt_tokens_cpu is not None
-                and num_computed_tokens_cpu is not None
-            ):
-                decode_steps_cpu = (
-                    num_computed_tokens_cpu[:num_decodes]
-                    - num_prompt_tokens_cpu[:num_decodes]
+            if num_prompt_tokens_cpu is not None:
+                ctx_lens = common_attn_metadata.compute_num_computed_tokens()
+                num_prompt_d = num_prompt_tokens_cpu.to(
+                    ctx_lens.device, non_blocking=True
                 )
-                first_decode_d = async_tensor_h2d(
-                    (decode_steps_cpu == 0).to(torch.int8).tolist(),
-                    dtype=torch.int8,
-                    device=cursor_device,
-                )
+                first_decode_d = (
+                    ctx_lens[:num_decodes] == num_prompt_d[:num_decodes]
+                ).to(torch.int8)
                 reset_spec_cursors(
                     self.spec_write_pos,
                     self.spec_post_origin,
