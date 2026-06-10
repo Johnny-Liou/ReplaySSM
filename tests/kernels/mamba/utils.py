@@ -78,7 +78,7 @@ def selective_state_update_ref(
     return out
 
 
-def selective_state_update_cached_ref(
+def selective_state_update_flashssm_state_and_output_ref(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -200,7 +200,7 @@ def selective_state_update_cached_ref(
     return out
 
 
-def selective_state_update_cached_bc_ref(
+def selective_state_update_flashssm_output_only_ref(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,

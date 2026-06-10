@@ -1,31 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# GDN cached SPECULATIVE-decode kernel -- CIRCULAR cache (cache_base origin, no
-# relocate), vLLM-flavored. Ported from FlashMamba's bit-exact reference
-#   ../FlashMamba/ablation_gdn/bench_gdn_cached_spec_conv1d/
-#       gdn_cached_spec_decode_circular.py
-# with these vLLM adaptations (see implementation_markdown/CACHED_SPEC_GDN_INTEGRATION.md):
-#
-#   * PACKED VARLEN layout. The reference takes dense [B, S, ...] with one
-#     batch-wide ``spec_len``; vLLM packs all verify tokens contiguously and
-#     gives a per-request window via ``query_start_loc`` (cu_seqlens). Each
-#     program reads ``bos = qsl[i_n]`` and ``spec_len = qsl[i_n+1] - bos`` and
-#     indexes ``mixed_qkv`` / ``a`` / ``b`` / ``o`` by ``bos + o_s``.
-#   * BLOCK-KEYED cursors. ``write_pos`` / ``cache_base`` / ``is_flush`` are
-#     persistent ``(num_state_slots,)`` buffers indexed by the physical block id
-#     ``ssm_state_indices[i_n]`` (the reference already keys them this way).
-#   * TRUNCATION. ``spec_len_eff = min(spec_len, max_cache_len - write_pos)`` so
-#     ``write_pos + spec_len_eff <= max_cache_len`` always (the circular buffer
-#     never self-collides). Mirrors the Mamba2 as-built decision.
-#   * PREALLOCATED packed ``out`` (CUDA-graph safe), not a fresh ``torch.empty``.
-#
-# The math is a verbatim port; only indexing (packed-varlen + block-keyed paged
-# cursors) and the truncation cap differ. ``d/k/g`` caches are paged + indexed
-# by the physical block, same as the non-spec cached GDN kernel.
-#
-# Two launches per step (``IS_FLUSH`` verify/flush specializations, device-side
-# routing, exactly-one-writer) so the whole step is CUDA-graph capturable.
 
 from __future__ import annotations
 
@@ -35,7 +9,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def gdn_spec_decode_dispatch_circular_kernel(
+def gdn_flashssm_spec_circular_kernel(
     mixed_qkv,  # [total_tokens, qkv_dim]  packed, channel-last (q|k|v)
     a,  # [total_tokens, HV]
     b,  # [total_tokens, HV]
@@ -203,7 +177,7 @@ def gdn_spec_decode_dispatch_circular_kernel(
         k_rnorm = tl.where(mask_s, 1.0, 0.0)
 
     # ------------------------------------------------------------------
-    # Block 1 + 2 (+ Block 6 flush) fused K loop.
+    # K-Tiled Fused Projection and Intra-Spec Matrices (+ flush)
     # ------------------------------------------------------------------
     hw_q = tl.zeros([BV, BS], dtype=tl.float32)
     hw_k = tl.zeros([BV, BS], dtype=tl.float32)
@@ -300,7 +274,7 @@ def gdn_spec_decode_dispatch_circular_kernel(
         hw_k = b_total_decay * hw_k + tl.dot(b_d_scaled, scores_k.to(b_d_scaled.dtype))
 
     # ------------------------------------------------------------------
-    # Block 2: strictly-lower A and T = (I + A)^{-1}.
+    # strictly-lower A and T = (I + A)^{-1}.
     # ------------------------------------------------------------------
     lower = (o_s[:, None] > o_s[None, :]) & mask_s[:, None] & mask_s[None, :]
     diff_ij = G_s[:, None] - G_s[None, :]
@@ -315,7 +289,7 @@ def gdn_spec_decode_dispatch_circular_kernel(
     T_mat = b_Ai + (o_s[:, None] == o_s[None, :]).to(tl.float32)
 
     # ------------------------------------------------------------------
-    # Block 3: R and D_spec = R @ T^T.
+    # R and D_spec = R @ T^T.
     # ------------------------------------------------------------------
     p_v = (
         mixed_qkv
@@ -333,7 +307,7 @@ def gdn_spec_decode_dispatch_circular_kernel(
         D_spec += Rj[:, None] * Tj[None, :]
 
     # ------------------------------------------------------------------
-    # Block 4: outputs.
+    # outputs.
     # ------------------------------------------------------------------
     causalF = (o_s[:, None] <= o_s[None, :]) & mask_s[:, None] & mask_s[None, :]
     diff_ji = G_s[None, :] - G_s[:, None]
@@ -348,7 +322,7 @@ def gdn_spec_decode_dispatch_circular_kernel(
     tl.store(p_o, tl.trans(O_tile).to(p_o.dtype.element_ty), mask=out_mask)
 
     # ------------------------------------------------------------------
-    # Block 5: write speculative d / g at circular positions (phys_spec).
+    # write speculative d / g at circular positions (phys_spec).
     # ------------------------------------------------------------------
     spec_pos = b_write_pos + o_s
     spec_store_mask = mask_s & (spec_pos < MAX_CACHE_LEN)
@@ -367,13 +341,6 @@ def gdn_spec_decode_dispatch_circular_kernel(
         tl.store(p_cur_g, g_s, mask=spec_store_mask)
 
 
-# ---------------------------------------------------------------------------
-# Commit kernel (block-keyed; runs once per step, device-only, CG-safe).
-# total_commit = min(num_accepted, L - write_pos)  [num_accepted already incl. bonus]
-# non-flush: write_pos += total_commit; cache_base unchanged.
-# flush:     cache_base = (cache_base + write_pos) & (L-1); write_pos = total_commit.
-# next_is_flush = (new_write_pos + max_spec_len) >= L.
-# ---------------------------------------------------------------------------
 @triton.jit
 def _advance_gdn_spec_cursors_kernel(
     write_pos_ptr,
@@ -422,7 +389,7 @@ def _advance_gdn_spec_cursors_kernel(
     # sampler reads logits for EVERY window position -- so a truncated position
     # would feed the sampler an uninitialized-`out` garbage logit (emitting a
     # wrong token) and desync the committed state. Usable committed history is
-    # max_cache_len - 2*max_spec_len; raise mamba_max_cache_len for more.
+    # max_cache_len - 2*max_spec_len; raise flashssm_buffer_len for more.
     next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) >= MAX_CACHE_LEN).to(tl.int8)
 
     tl.store(write_pos_ptr + blk, new_wp, mask=valid)
@@ -430,12 +397,8 @@ def _advance_gdn_spec_cursors_kernel(
     tl.store(is_flush_ptr + blk, next_is_flush, mask=valid)
 
 
-# ---------------------------------------------------------------------------
-# Prefill->decode reset (block-keyed). Sets write_pos=0, cache_base=0,
-# is_flush=(max_spec_len >= max_cache_len) for first-decode rows.
-# ---------------------------------------------------------------------------
 @triton.jit
-def _reset_gdn_spec_cursors_kernel(
+def _reset_gdn_flashssm_spec_cursors_kernel(
     write_pos_ptr,
     cache_base_ptr,
     is_flush_ptr,
@@ -521,7 +484,7 @@ def _launch_gdn_spec(
     BC = max(16, triton.next_power_of_2(max_cache_len))
 
     grid = (triton.cdiv(V, BV), B, HV)
-    gdn_spec_decode_dispatch_circular_kernel[grid](
+    gdn_flashssm_spec_circular_kernel[grid](
         mixed_qkv,
         a,
         b,
@@ -569,7 +532,7 @@ def _launch_gdn_spec(
     )
 
 
-def gdn_spec_cached_decode(
+def gdn_flashssm_spec_decode(
     mixed_qkv: torch.Tensor,  # [total_tokens, qkv_dim]  post-conv packed (q|k|v)
     a: torch.Tensor,  # [total_tokens, HV]
     b: torch.Tensor,  # [total_tokens, HV]
@@ -606,7 +569,7 @@ def gdn_spec_cached_decode(
     Two launches (verify + flush ``IS_FLUSH`` specializations); device-side
     per-row routing keeps the step CUDA-graph capturable. Cursors are block-keyed
     (indexed by ``ssm_state_indices``) and advanced out-of-kernel by
-    :func:`commit_gdn_spec_cached`.
+    :func:`commit_gdn_flashssm_spec`.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
@@ -633,7 +596,7 @@ def gdn_spec_cached_decode(
     return out
 
 
-def commit_gdn_spec_cached(
+def commit_gdn_flashssm_spec(
     write_pos: torch.Tensor,
     cache_base: torch.Tensor,
     is_flush: torch.Tensor,
@@ -666,7 +629,7 @@ def commit_gdn_spec_cached(
     )
 
 
-def reset_gdn_spec_cursors(
+def reset_gdn_flashssm_spec_cursors(
     write_pos: torch.Tensor,
     cache_base: torch.Tensor,
     is_flush: torch.Tensor,
@@ -681,7 +644,7 @@ def reset_gdn_spec_cursors(
     BLOCK = triton.next_power_of_2(max(1, n_rows))
     # Early-flush margin (2 * max_spec_len): mirror _advance_gdn_spec_cursors_kernel.
     init_flush = 1 if 2 * max_spec_len >= max_cache_len else 0
-    _reset_gdn_spec_cursors_kernel[(1,)](
+    _reset_gdn_flashssm_spec_cursors_kernel[(1,)](
         write_pos,
         cache_base,
         is_flush,

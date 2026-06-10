@@ -675,10 +675,10 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
-    mamba_max_cache_len: int = CacheConfig.mamba_max_cache_len
-    mamba_use_cached_kernel: bool = CacheConfig.mamba_use_cached_kernel
-    mamba_cached_kernel_variant: str = CacheConfig.mamba_cached_kernel_variant
-    mamba_use_cached_spec_kernel: bool = CacheConfig.mamba_use_cached_spec_kernel
+    flashssm_buffer_len: int = CacheConfig.flashssm_buffer_len
+    use_flashssm: bool = CacheConfig.use_flashssm
+    flashssm_route: str = CacheConfig.flashssm_route
+    use_flashssm_spec: bool = CacheConfig.use_flashssm_spec
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     enable_mamba_cache_stochastic_rounding: bool = (
@@ -1161,18 +1161,18 @@ class EngineArgs:
             "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
         )
         cache_group.add_argument(
-            "--mamba-max-cache-len", **cache_kwargs["mamba_max_cache_len"]
+            "--flashssm-buffer-len", **cache_kwargs["flashssm_buffer_len"]
         )
         cache_group.add_argument(
-            "--mamba-use-cached-kernel", **cache_kwargs["mamba_use_cached_kernel"]
+            "--use-flashssm", **cache_kwargs["use_flashssm"]
         )
         cache_group.add_argument(
-            "--mamba-cached-kernel-variant",
-            **cache_kwargs["mamba_cached_kernel_variant"],
+            "--flashssm-route",
+            **cache_kwargs["flashssm_route"],
         )
         cache_group.add_argument(
-            "--mamba-use-cached-spec-kernel",
-            **cache_kwargs["mamba_use_cached_spec_kernel"],
+            "--use-flashssm-spec",
+            **cache_kwargs["use_flashssm_spec"],
         )
         cache_group.add_argument(
             "--kv-offloading-size", **cache_kwargs["kv_offloading_size"]
@@ -1786,10 +1786,10 @@ class EngineArgs:
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             mamba_cache_mode=self.mamba_cache_mode,
-            mamba_max_cache_len=self.mamba_max_cache_len,
-            mamba_use_cached_kernel=self.mamba_use_cached_kernel,
-            mamba_cached_kernel_variant=self.mamba_cached_kernel_variant,
-            mamba_use_cached_spec_kernel=self.mamba_use_cached_spec_kernel,
+            flashssm_buffer_len=self.flashssm_buffer_len,
+            use_flashssm=self.use_flashssm,
+            flashssm_route=self.flashssm_route,
+            use_flashssm_spec=self.use_flashssm_spec,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )

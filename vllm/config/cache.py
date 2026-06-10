@@ -34,7 +34,7 @@ CacheDType = Literal[
 ]
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
-MambaCachedKernelVariant = Literal["recurrent", "attention_like"]
+FlashSSMRoute = Literal["state_and_output", "output_only"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
@@ -139,26 +139,27 @@ class CacheConfig:
     - "align": only cache the mamba state of the last token of each scheduler step and
            when the token is at position i * block_size.
     """
-    mamba_max_cache_len: int = Field(default=16, gt=0)
-    """Maximum number of autoregressive Mamba2 decode steps to accumulate in
-    the cached-dot SSM update ring before flushing the checkpoint state."""
-    mamba_use_cached_kernel: bool = False
-    """Use the cached-dot Mamba2 decode SSM update kernel. This is only
-    supported for autoregressive decode with mamba_cache_mode='none'."""
-    mamba_cached_kernel_variant: MambaCachedKernelVariant = "recurrent"
-    """Variant of the cached Mamba2 decode kernel (only meaningful when
-    mamba_use_cached_kernel is True):
-    - "recurrent" (default): cached-dot. Reconstructs the SSM state every
-       step via tl.dot.
-    - "attention_like": cached-bc. Replaces the per-step tl.dot reconstruction
-       on non-flush steps with a BC-factorized precompute + tl.sum reduction
-       (the new state is only materialized on flush steps)."""
-    mamba_use_cached_spec_kernel: bool = False
-    """Use the cached SPECULATIVE-decode Mamba2 SSM update kernel (circular
-    post-conv cache + truncation). Requires speculative decoding and
+    flashssm_buffer_len: int = Field(default=16, gt=0)
+    """FlashSSM input-buffer capacity: the maximum number of autoregressive
+    Mamba2 decode steps to accumulate in the ring buffer before flushing the
+    checkpoint state."""
+    use_flashssm: bool = False
+    """Use the FlashSSM Mamba2 decode kernel (cache recent SSM inputs instead
+    of writing the recurrent state back to HBM each step). Only supported for
+    autoregressive decode with mamba_cache_mode='none'."""
+    flashssm_route: FlashSSMRoute = "output_only"
+    """FlashSSM compute route (only meaningful when use_flashssm is True):
+    - "output_only" (default): inner-product route. Computes the output from
+       the checkpoint state plus the cached inputs without materializing the
+       per-step state (the state is only built on flush steps).
+    - "state_and_output": outer-product route. Reconstructs the full SSM state
+       every step via tl.dot, then reads the output from it."""
+    use_flashssm_spec: bool = False
+    """Use the FlashSSM speculative-decode Mamba2 kernel (circular post-conv
+    cache + truncation). Requires speculative decoding and
     mamba_cache_mode='none'; reuses vLLM's causal_conv1d_update for the conv
-    (hybrid). Mutually exclusive with mamba_use_cached_kernel. The window cap
-    uses mamba_max_cache_len, which must be a power of two and >= 1 +
+    (hybrid). Mutually exclusive with use_flashssm. The window cap uses
+    flashssm_buffer_len, which must be a power of two and >= 1 +
     num_speculative_tokens."""
 
     # Will be set after profiling.

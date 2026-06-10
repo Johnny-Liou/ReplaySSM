@@ -1,27 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Cached GDN (Gated Delta Network) autoregressive decode kernel -- K-tiled
-# (occupancy-oriented) variant, ported from FlashMamba
-# (ablation_gdn/bench/gdn_cached_decode_ktile.py).
-#
-# High-level idea: instead of reading AND writing the full (HV, V, K) SSM
-# state every decode step, keep a *checkpoint* state in HBM (written only every
-# MAX_CACHE_LEN steps) and cache the per-step delta-rule update vector ``d``,
-# the key ``k``, and the decay scalar ``g`` in a small ring buffer. Every step
-# reconstructs the output from ``checkpoint + cached history`` via two tl.dot
-# projections, writing the full state back to HBM only on flush steps.
-#
-# vLLM-specific changes vs the FlashMamba reference:
-#   - ``write_pos`` is indexed by the dense decode row ``i_n`` (program_id(1)),
-#     not by the physical state slot. vLLM derives ``write_pos`` per request in
-#     the attention-metadata build (write_pos = decode_step % MAX_CACHE_LEN), so
-#     there is no ``advance_write_pos`` kernel and recycled paged blocks need no
-#     zero-init (write_pos is 0 at a request's first decode step).
-#   - Uses ``vllm.triton_utils`` aliases and a caller-supplied (preallocated)
-#     ``out`` tensor (CUDA-graph friendly). The paged ``state_batch_indices``
-#     indirection is already present (via ``ssm_state_indices``), including the
-#     NULL-block (state_idx <= 0) early return for padded CUDA-graph slots.
 
 from __future__ import annotations
 
@@ -31,7 +9,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def fused_recurrent_gated_delta_rule_cached_decode_kernel(
+def fused_recurrent_gated_delta_rule_flashssm_decode_kernel(
     mixed_qkv, a, b, A_log, dt_bias, o, h0, ht,
     d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale,
     stride_mixed_qkv_tok: tl.constexpr,
@@ -168,7 +146,7 @@ def fused_recurrent_gated_delta_rule_cached_decode_kernel(
             tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
 
 
-def fused_recurrent_gated_delta_rule_cached_decode(
+def fused_recurrent_gated_delta_rule_flashssm_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
@@ -263,7 +241,7 @@ def fused_recurrent_gated_delta_rule_cached_decode(
     BC = max(16, triton.next_power_of_2(max_cache_len))
 
     grid = (triton.cdiv(V, BV), B, HV)
-    fused_recurrent_gated_delta_rule_cached_decode_kernel[grid](
+    fused_recurrent_gated_delta_rule_flashssm_decode_kernel[grid](
         mixed_qkv=mixed_qkv, a=a, b=b, A_log=A_log, dt_bias=dt_bias, o=out,
         h0=initial_state, ht=initial_state,
         d_cache=d_cache, k_cache=k_cache, g_cache=g_cache,

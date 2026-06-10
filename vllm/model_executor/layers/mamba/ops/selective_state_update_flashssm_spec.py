@@ -1,41 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Copyright (c) 2024, Tri Dao, Albert Gu.
-#
-# Mamba2 cached SPECULATIVE-decode SSM update for vLLM (hybrid conv variant).
-#
-# Ported from FlashMamba's bit-exact circular spec kernel
-#   ../FlashMamba/mamba_ssm/ops/triton/selective_state_update_spec.py
-# (validated bit-exact vs Approach A + cudaGraph; see
-#  ablation_mamba2/bench_mamba2_cached_spec_conv1d/final/RESULTS.md).
-#
-# vLLM adaptations vs. the FlashMamba kernels:
-#   * Hybrid conv: the custom `causal_conv1d_spec_update` + `pre_conv_cache` is
-#     NOT ported. vLLM reuses its in-tree `causal_conv1d_update` (whose
-#     IS_SPEC_DECODING path already rolls conv_state by num_accepted) and feeds
-#     the post-conv `x|B|C` straight into the scatter below. There is therefore
-#     no `conv_seq_pos` cursor here.
-#   * Paged state: every cache (post_conv_cache / dt_cache / ssm checkpoint) is
-#     indexed by a physical block id from `state_batch_indices` (the mixer's
-#     `state_indices_tensor_d[:, 0]`); rows mapped to `null_block_id` early-out.
-#   * Block-keyed cursors: `write_pos` / `post_origin` / `is_flush` are persistent
-#     `(num_state_slots,)` buffers indexed by the physical block (not the dense
-#     decode row), advanced by `commit_spec_cached` once per step.
-#   * Packed varlen: the fresh spec window is packed contiguously
-#     ([total_decode_tokens, ...]); per-request `spec_len` is read in-kernel from
-#     `query_start_loc` (mirroring the baseline `_selective_scan_update_kernel`'s
-#     IS_VARLEN block). The output is written into a caller-preallocated packed
-#     `out` (CUDA-graph safe), not a fresh `torch.empty`.
-#   * num_accepted: vLLM's `num_accepted_tokens` already includes the bonus
-#     token (min 1), so the commit uses `total_commit = num_accepted_tokens`
-#     directly (NOT FlashMamba's `accepted + 1`).
-#
-# Kernels:
-#   _fused_scatter_precompute_kernel             scatter spec into circular cache + CB
-#   _selective_scan_update_spec_cache_circular_kernel   outputs + flush reconstruction
-#   _advance_write_pos_origin_kernel             commit: write_pos + origin + next is_flush
-#   _reset_spec_cursors_kernel                   prefill->decode per-request cursor reset
 
 import torch
 import torch.nn.functional as F
@@ -43,7 +7,6 @@ import torch.nn.functional as F
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
 
 # ======================================================================
 # Fused scatter + precompute  (grid: (batch, ngroups))
@@ -223,14 +186,6 @@ def _fused_scatter_precompute_kernel(
     )
 
 
-# ======================================================================
-# Main scan  (grid: (cdiv(headdim, BLOCK_SIZE_M), batch, nheads))
-#
-# Reads the whole window [0, write_pos+spec_len) from the circular cache as one
-# K=BLOCK_SIZE_CACHE tile (tensor-core friendly). Per-row ``is_flush`` is loaded
-# at runtime and branched in-kernel (single launch, no host sync). B_cache is
-# only touched on the flush branch.
-# ======================================================================
 @triton.heuristics({"HAS_DT_BIAS": lambda a: a["dt_bias_ptr"] is not None})
 @triton.heuristics({"HAS_D": lambda a: a["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda a: a["z_ptr"] is not None})
@@ -238,7 +193,7 @@ def _fused_scatter_precompute_kernel(
     {"BLOCK_SIZE_DSTATE": lambda a: triton.next_power_of_2(a["dstate"])}
 )
 @triton.jit
-def _selective_scan_update_spec_cache_circular_kernel(
+def _flashssm_spec_circular_kernel(
     state_ptr,
     x_cache_ptr,
     dt_cache_ptr,
@@ -467,14 +422,6 @@ def _selective_scan_update_spec_cache_circular_kernel(
             )
 
 
-# ======================================================================
-# Commit / advance  (grid: (1,))  -- device-only, cudaGraph-safe, no relocate.
-#
-# Block-keyed: each dense decode row `i` advances cursors for its physical
-# block `state_batch_indices[i]`. Rows mapped to `null_block_id` are skipped
-# (total_commit = 0). vLLM `num_accepted_tokens` already includes the bonus, so
-# total_commit = num_accepted (NOT accepted + 1).
-# ======================================================================
 @triton.jit
 def _advance_write_pos_origin_kernel(
     write_pos_ptr,
@@ -505,7 +452,7 @@ def _advance_write_pos_origin_kernel(
     # scattered into the cache, so at most (max_cache_len - write_pos) tokens can
     # become committed history. Caps write_pos so the next window has room (the
     # kernel truncates the verify window to the same bound). Upstream must reject
-    # the truncated drafts so committed == emitted (see selective_state_update_spec_cache).
+    # the truncated drafts so committed == emitted (see flush reconstruction).
     total_commit = tl.minimum(total_commit, (MAX_CACHE_LEN - write_pos)).to(tl.int32)
     flush_now = (total_commit > 0) & (is_flush_cur != 0)
     new_origin = tl.where(
@@ -525,7 +472,7 @@ def _advance_write_pos_origin_kernel(
     # positions UNWRITTEN in the preallocated `out`, and the rejection sampler
     # (unaware of the truncation) then accepts garbage logits -> corrupted text +
     # acceptance collapse. Usable committed history becomes max_cache_len -
-    # 2*max_spec_len; raise mamba_max_cache_len for more. (Mirrors the GDN
+    # 2*max_spec_len; raise flashssm_buffer_len for more. (Mirrors the GDN
     # cached-spec fix; see CACHED_SPEC_GDN_INTEGRATION.md §10.3.)
     next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) >= MAX_CACHE_LEN).to(tl.int8)
     tl.store(post_origin_ptr + blk, new_origin, mask=valid)
@@ -533,13 +480,8 @@ def _advance_write_pos_origin_kernel(
     tl.store(is_flush_ptr + blk, next_is_flush, mask=valid)
 
 
-# ======================================================================
-# Prefill -> decode cursor reset (grid: (1,)).  Per-request, block-keyed.
-# Sets write_pos=0, origin=0, is_flush=(MAX_SPEC_LEN >= MAX_CACHE_LEN) for the
-# rows flagged first-decode. No conv seed (hybrid: conv_state carries context).
-# ======================================================================
 @triton.jit
-def _reset_spec_cursors_kernel(
+def _reset_flashssm_spec_cursors_kernel(
     write_pos_ptr,
     post_origin_ptr,
     is_flush_ptr,
@@ -580,7 +522,7 @@ def _get_spec_launch_config(dstate: int, max_spec_len: int) -> tuple[int, int]:
     return bsm, nw
 
 
-def selective_state_update_spec_cache(
+def selective_state_update_flashssm_spec(
     state_checkpoint: torch.Tensor,  # (num_blocks, H, P, N) checkpoint (flush updates in place)
     post_conv_cache: torch.Tensor,  # (num_blocks, cache_buf_len, conv_dim) circular
     dt_cache: torch.Tensor,  # (num_blocks, H, cache_buf_len) circular
@@ -613,7 +555,7 @@ def selective_state_update_spec_cache(
     ``causal_conv1d_update`` (packed channel-last ``[total_tokens, conv_dim]``).
     Fuses scatter + CB-precompute in one ``(batch, ngroups)`` launch, then runs
     the circular scan. Cursors are block-keyed (indexed by
-    ``state_batch_indices``); the commit (``commit_spec_cached``) advances them
+    ``state_batch_indices``); the commit (``commit_flashssm_spec``) advances them
     once per step. Writes into the caller-supplied packed ``out``
     ``[total_tokens, H, P]``.
     """
@@ -724,7 +666,7 @@ def selective_state_update_spec_cache(
     )
     grid = lambda META: (triton.cdiv(headdim, META["BLOCK_SIZE_M"]), batch, nheads)
     with torch.cuda.device(state_checkpoint.device.index):
-        _selective_scan_update_spec_cache_circular_kernel[grid](
+        _flashssm_spec_circular_kernel[grid](
             state_checkpoint,
             x_view,
             dt_cache,
@@ -792,7 +734,7 @@ def selective_state_update_spec_cache(
     return out
 
 
-def commit_spec_cached(
+def commit_flashssm_spec(
     write_pos: torch.Tensor,
     post_conv_state_pos: torch.Tensor,
     is_flush: torch.Tensor,
@@ -830,7 +772,7 @@ def commit_spec_cached(
         )
 
 
-def reset_spec_cursors(
+def reset_flashssm_spec_cursors(
     write_pos: torch.Tensor,
     post_conv_state_pos: torch.Tensor,
     is_flush: torch.Tensor,
@@ -848,7 +790,7 @@ def reset_spec_cursors(
     # so the first decode after prefill agrees with the steady-state flush cadence.
     init_is_flush = 1 if 2 * max_spec_len >= max_cache_len else 0
     with torch.cuda.device(write_pos.device.index):
-        _reset_spec_cursors_kernel[(1,)](
+        _reset_flashssm_spec_cursors_kernel[(1,)](
             write_pos,
             post_conv_state_pos,
             is_flush,
@@ -864,7 +806,7 @@ def reset_spec_cursors(
 
 
 __all__ = [
-    "selective_state_update_spec_cache",
-    "commit_spec_cached",
-    "reset_spec_cursors",
+    "selective_state_update_flashssm_spec",
+    "commit_flashssm_spec",
+    "reset_flashssm_spec_cursors",
 ]

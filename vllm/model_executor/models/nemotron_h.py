@@ -817,18 +817,18 @@ class NemotronHForCausalLM(
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, ...]:
         cache_config = vllm_config.cache_config
-        if cache_config.mamba_use_cached_spec_kernel:
+        if cache_config.use_flashssm_spec:
             return MambaStateDtypeCalculator.mamba2_spec_cached_state_dtype(
                 vllm_config.model_config.dtype,
                 cache_config.mamba_cache_dtype,
                 cache_config.mamba_ssm_cache_dtype,
-                mamba_use_cached_spec_kernel=cache_config.mamba_use_cached_spec_kernel,
+                use_flashssm_spec=cache_config.use_flashssm_spec,
             )
         return MambaStateDtypeCalculator.mamba2_cached_state_dtype(
             vllm_config.model_config.dtype,
             cache_config.mamba_cache_dtype,
             cache_config.mamba_ssm_cache_dtype,
-            mamba_use_cached_kernel=cache_config.mamba_use_cached_kernel,
+            use_flashssm=cache_config.use_flashssm,
         )
 
     @classmethod
@@ -845,7 +845,7 @@ class NemotronHForCausalLM(
             Tuple containing:
             - conv_state_shape: Shape for convolutional state cache
             - temporal_state_shape: Shape for state space model cache
-            - (when the cached-dot decode kernel is enabled) the
+            - (when the state-and-output decode kernel is enabled) the
               x_cache/dt_cache/B_cache ring-buffer shapes
         """
         parallel_config = vllm_config.parallel_config
@@ -853,7 +853,7 @@ class NemotronHForCausalLM(
         hf_config = vllm_config.model_config.hf_config
         intermediate_size = hf_config.mamba_num_heads * hf_config.mamba_head_dim
 
-        if cache_config.mamba_use_cached_spec_kernel:
+        if cache_config.use_flashssm_spec:
             return MambaStateShapeCalculator.mamba2_spec_cached_state_shape(
                 intermediate_size=intermediate_size,
                 tp_world_size=parallel_config.tensor_parallel_size,
@@ -863,8 +863,8 @@ class NemotronHForCausalLM(
                 state_size=hf_config.ssm_state_size,
                 conv_kernel=hf_config.conv_kernel,
                 num_spec=vllm_config.num_speculative_tokens,
-                mamba_use_cached_spec_kernel=cache_config.mamba_use_cached_spec_kernel,
-                mamba_max_cache_len=cache_config.mamba_max_cache_len,
+                use_flashssm_spec=cache_config.use_flashssm_spec,
+                flashssm_buffer_len=cache_config.flashssm_buffer_len,
             )
         return MambaStateShapeCalculator.mamba2_cached_state_shape(
             intermediate_size=intermediate_size,
@@ -875,8 +875,8 @@ class NemotronHForCausalLM(
             state_size=hf_config.ssm_state_size,
             conv_kernel=hf_config.conv_kernel,
             num_spec=vllm_config.num_speculative_tokens,
-            mamba_use_cached_kernel=cache_config.mamba_use_cached_kernel,
-            mamba_max_cache_len=cache_config.mamba_max_cache_len,
+            use_flashssm=cache_config.use_flashssm,
+            flashssm_buffer_len=cache_config.flashssm_buffer_len,
         )
 
     @classmethod

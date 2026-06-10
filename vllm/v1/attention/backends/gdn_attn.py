@@ -66,13 +66,13 @@ class GDNAttentionMetadata:
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
     # Per-decode-row ring write position for the cached decode kernel.
-    # shape: [num_decodes]; None unless mamba_use_cached_kernel is enabled.
+    # shape: [num_decodes]; None unless use_flashssm is enabled.
     write_pos_d: torch.Tensor | None = None
 
     # Cached-SPEC decode cursors: persistent, block-keyed (full (num_blocks,)
     # fixed-address buffers indexed by spec_state_indices_tensor[:, 0]), advanced
-    # once per step by commit_gdn_spec_cached. None unless
-    # mamba_use_cached_spec_kernel is enabled. See CACHED_SPEC_GDN_INTEGRATION.md.
+    # once per step by commit_gdn_flashssm_spec. None unless
+    # use_flashssm_spec is enabled. See CACHED_SPEC_GDN_INTEGRATION.md.
     spec_write_pos_d: torch.Tensor | None = None
     spec_cache_base_d: torch.Tensor | None = None
     spec_is_flush_d: torch.Tensor | None = None
@@ -178,9 +178,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # so recycled paged blocks need no zero-init; see
         # implementation_markdown/CACHED_GDN_INTEGRATION.md.
         self.use_cached_kernel: bool = (
-            vllm_config.cache_config.mamba_use_cached_kernel
+            vllm_config.cache_config.use_flashssm
         )
-        self.max_cache_len: int = vllm_config.cache_config.mamba_max_cache_len
+        self.max_cache_len: int = vllm_config.cache_config.flashssm_buffer_len
         if self.use_cached_kernel:
             self.decode_write_pos_d: torch.Tensor = torch.empty(
                 (self.decode_cudagraph_max_bs,),
@@ -190,10 +190,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         # Cached-SPEC decode: block-keyed cursors (sized num_gpu_blocks),
         # allocated lazily on first build (num_gpu_blocks is unknown here), and
-        # advanced once per step by commit_gdn_spec_cached. See
+        # advanced once per step by commit_gdn_flashssm_spec. See
         # implementation_markdown/CACHED_SPEC_GDN_INTEGRATION.md.
         self.use_cache_spec_kernel: bool = (
-            vllm_config.cache_config.mamba_use_cached_spec_kernel
+            vllm_config.cache_config.use_flashssm_spec
         )
         self.max_spec_len: int = 1 + self.num_spec
         self.cursor_device = device
@@ -429,7 +429,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_computed_tokens_cpu = m._num_computed_tokens_cpu
             if num_prompt_tokens_cpu is None or num_computed_tokens_cpu is None:
                 raise ValueError(
-                    "mamba_use_cached_kernel requires CPU prompt and "
+                    "use_flashssm requires CPU prompt and "
                     "computed-token counts to derive decode write positions"
                 )
             decode_steps_cpu = (
@@ -443,7 +443,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             valid_decode_rows = query_lens_cpu > 0
             if torch.any(decode_steps_cpu[valid_decode_rows] < 0).item():
                 raise ValueError(
-                    "mamba_use_cached_kernel requires decode-step counts that "
+                    "use_flashssm requires decode-step counts that "
                     "exclude prompt tokens and start at zero"
                 )
             decode_steps_cpu = torch.where(
@@ -466,9 +466,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # the cursors are full (num_gpu_blocks,) fixed-address buffers read by
         # the captured verify kernel.
         if self.use_cache_spec_kernel and num_spec_decodes > 0:
-            from vllm.model_executor.layers.fla.ops.gdn_spec_cached_decode import (
-                commit_gdn_spec_cached,
-                reset_gdn_spec_cursors,
+            from vllm.model_executor.layers.fla.ops.gdn_flashssm_spec_decode import (
+                commit_gdn_flashssm_spec,
+                reset_gdn_flashssm_spec_cursors,
             )
 
             assert spec_state_indices_tensor is not None
@@ -476,7 +476,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if self.spec_write_pos is None:
                 n_blocks = self.vllm_config.cache_config.num_gpu_blocks
                 assert n_blocks is not None and n_blocks > 0, (
-                    "--mamba-use-cached-spec-kernel needs num_gpu_blocks at "
+                    "--use-flashssm-spec needs num_gpu_blocks at "
                     "build time to size the block-keyed cursor buffers"
                 )
                 self.spec_write_pos = torch.zeros(
@@ -489,7 +489,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     n_blocks, dtype=torch.int8, device=self.cursor_device
                 )
             sbi = spec_state_indices_tensor[:, 0]
-            commit_gdn_spec_cached(
+            commit_gdn_flashssm_spec(
                 self.spec_write_pos,
                 self.spec_cache_base,
                 self.spec_is_flush,
@@ -516,7 +516,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     .to(query_start_loc.device, non_blocking=True)
                 )
                 first_decode_d = first_decode_full.index_select(0, spec_row_idx)
-                reset_gdn_spec_cursors(
+                reset_gdn_flashssm_spec_cursors(
                     self.spec_write_pos,
                     self.spec_cache_base,
                     self.spec_is_flush,
