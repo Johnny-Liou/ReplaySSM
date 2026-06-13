@@ -675,10 +675,10 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
-    flashssm_buffer_len: int = CacheConfig.flashssm_buffer_len
-    use_flashssm: bool = CacheConfig.use_flashssm
-    flashssm_route: str = CacheConfig.flashssm_route
-    use_flashssm_spec: bool = CacheConfig.use_flashssm_spec
+    chunkdecode_buffer_len: int = CacheConfig.chunkdecode_buffer_len
+    use_chunkdecode: bool = CacheConfig.use_chunkdecode
+    chunkdecode_route: str = CacheConfig.chunkdecode_route
+    use_chunkdecode_spec: bool = CacheConfig.use_chunkdecode_spec
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     enable_mamba_cache_stochastic_rounding: bool = (
@@ -1161,18 +1161,18 @@ class EngineArgs:
             "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
         )
         cache_group.add_argument(
-            "--flashssm-buffer-len", **cache_kwargs["flashssm_buffer_len"]
+            "--chunkdecode-buffer-len", **cache_kwargs["chunkdecode_buffer_len"]
         )
         cache_group.add_argument(
-            "--use-flashssm", **cache_kwargs["use_flashssm"]
+            "--use-chunkdecode", **cache_kwargs["use_chunkdecode"]
         )
         cache_group.add_argument(
-            "--flashssm-route",
-            **cache_kwargs["flashssm_route"],
+            "--chunkdecode-route",
+            **cache_kwargs["chunkdecode_route"],
         )
         cache_group.add_argument(
-            "--use-flashssm-spec",
-            **cache_kwargs["use_flashssm_spec"],
+            "--use-chunkdecode-spec",
+            **cache_kwargs["use_chunkdecode_spec"],
         )
         cache_group.add_argument(
             "--kv-offloading-size", **cache_kwargs["kv_offloading_size"]
@@ -1786,10 +1786,10 @@ class EngineArgs:
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             mamba_cache_mode=self.mamba_cache_mode,
-            flashssm_buffer_len=self.flashssm_buffer_len,
-            use_flashssm=self.use_flashssm,
-            flashssm_route=self.flashssm_route,
-            use_flashssm_spec=self.use_flashssm_spec,
+            chunkdecode_buffer_len=self.chunkdecode_buffer_len,
+            use_chunkdecode=self.use_chunkdecode,
+            chunkdecode_route=self.chunkdecode_route,
+            use_chunkdecode_spec=self.use_chunkdecode_spec,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )

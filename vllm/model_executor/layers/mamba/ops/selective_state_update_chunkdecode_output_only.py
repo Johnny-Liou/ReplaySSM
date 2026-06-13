@@ -8,6 +8,114 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
+@triton.heuristics(
+    {
+        "HAS_STATE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"]
+        is not None
+    }
+)
+@triton.heuristics(
+    {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])}
+)
+@triton.jit
+def _chunkdecode_output_only_precompute_kernel(
+    B_ptr,
+    C_ptr,
+    B_cache_ptr,
+    write_pos_ptr,
+    is_flush_ptr,
+    BC_pre_ptr,
+    state_batch_indices_ptr,
+    null_block_id,
+    # Matrix dimensions
+    batch,
+    ngroups,
+    dstate,
+    # Input strides
+    stride_B_batch,
+    stride_B_group,
+    stride_B_dstate,
+    stride_C_batch,
+    stride_C_group,
+    stride_C_dstate,
+    # Cache strides
+    stride_Bc_batch,
+    stride_Bc_group,
+    stride_Bc_pos,
+    stride_Bc_dstate,
+    stride_BC_batch,
+    stride_BC_group,
+    stride_BC_pos,
+    stride_state_indices_batch,
+    stride_state_indices_T,
+    # Meta-parameters
+    MAX_CACHE_LEN: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    # heuristic-computed
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    HAS_STATE_BATCH_INDICES: tl.constexpr,
+):
+    pid_b = tl.program_id(axis=0)
+    pid_g = tl.program_id(axis=1)
+
+    # On flush steps the main kernel does not read BC_pre, so skip the work.
+    is_flush = tl.load(is_flush_ptr + pid_b) != 0
+    if is_flush:
+        return
+
+    if HAS_STATE_BATCH_INDICES:
+        state_batch_idx = tl.load(
+            state_batch_indices_ptr
+            + pid_b * stride_state_indices_batch
+            + 0 * stride_state_indices_T
+        ).to(tl.int64)
+        if state_batch_idx == null_block_id:
+            return
+    else:
+        state_batch_idx = pid_b
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
+
+    write_pos = tl.load(write_pos_ptr + pid_b).to(tl.int64)
+
+    B_ptr += pid_b * stride_B_batch + pid_g * stride_B_group
+    C_ptr += pid_b * stride_C_batch + pid_g * stride_C_group
+    B_cache_ptr += (
+        state_batch_idx * stride_Bc_batch + pid_g * stride_Bc_group
+    )
+    BC_pre_ptr += pid_b * stride_BC_batch + pid_g * stride_BC_group
+
+    B_cur = tl.load(
+        B_ptr + offs_n * stride_B_dstate,
+        mask=offs_n < dstate,
+        other=0.0,
+    )
+    C = tl.load(
+        C_ptr + offs_n * stride_C_dstate,
+        mask=offs_n < dstate,
+        other=0.0,
+    )
+    B_cache_ptrs = (
+        B_cache_ptr
+        + offs_k[:, None] * stride_Bc_pos
+        + offs_n[None, :] * stride_Bc_dstate
+    )
+    B_cache = tl.load(
+        B_cache_ptrs,
+        mask=(offs_k[:, None] < write_pos) & (offs_n[None, :] < dstate),
+        other=0.0,
+    )
+    B_all = tl.where(offs_k[:, None] == write_pos, B_cur[None, :], B_cache)
+    BC = tl.sum(B_all.to(tl.float32) * C[None, :].to(tl.float32), axis=1)
+
+    tl.store(
+        BC_pre_ptr + offs_k * stride_BC_pos,
+        BC,
+        mask=(offs_k <= write_pos) & (offs_k < MAX_CACHE_LEN),
+    )
+
+
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
@@ -21,7 +129,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])}
 )
 @triton.jit
-def _flashssm_state_and_output_kernel(
+def _chunkdecode_output_only_kernel(
     # Pointers to matrices
     state_ptr,
     x_ptr,
@@ -36,6 +144,7 @@ def _flashssm_state_and_output_kernel(
     x_cache_ptr,
     dt_cache_ptr,
     B_cache_ptr,
+    BC_pre_ptr,
     write_pos_ptr,
     is_flush_ptr,
     state_batch_indices_ptr,
@@ -85,13 +194,17 @@ def _flashssm_state_and_output_kernel(
     stride_Bc_group,
     stride_Bc_pos,
     stride_Bc_dstate,
+    stride_BC_batch,
+    stride_BC_group,
+    stride_BC_pos,
     stride_state_indices_batch,
     stride_state_indices_T,
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_K_CACHE: tl.constexpr,
+    BLOCK_SIZE_K_DOT: tl.constexpr,
     # heuristic-computed
     BLOCK_SIZE_DSTATE: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
@@ -116,7 +229,6 @@ def _flashssm_state_and_output_kernel(
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     write_pos = tl.load(write_pos_ptr + pid_b).to(tl.int64)
     is_flush = tl.load(is_flush_ptr + pid_b) != 0
@@ -134,6 +246,10 @@ def _flashssm_state_and_output_kernel(
         state_batch_idx * stride_Bc_batch
         + (pid_h // nheads_ngroups_ratio) * stride_Bc_group
     )
+    BC_pre_ptr += (
+        pid_b * stride_BC_batch
+        + (pid_h // nheads_ngroups_ratio) * stride_BC_group
+    )
 
     dt_cur = tl.load(dt_ptr).to(tl.float32)
     if HAS_DT_BIAS:
@@ -142,20 +258,6 @@ def _flashssm_state_and_output_kernel(
         dt_cur = tl.where(dt_cur <= 20.0, softplus(dt_cur), dt_cur)
 
     A = tl.load(A_ptr + pid_h * stride_A_head).to(tl.float32)
-
-    dt_all = tl.load(
-        dt_cache_ptr + offs_k * stride_dtc_pos,
-        mask=offs_k < write_pos,
-        other=0.0,
-    ).to(tl.float32)
-    dt_all = tl.where(offs_k == write_pos, dt_cur, dt_all)
-
-    dA_cumsum = A * tl.cumsum(dt_all, axis=0)
-    dA_total = A * tl.sum(dt_all, axis=0)
-    total_decay = tl.exp(dA_total)
-    scale = dt_all * tl.exp(dA_total - dA_cumsum)
-    scale = tl.where(offs_k <= write_pos, scale, 0.0)
-
     x_cur = tl.load(x_ptr + offs_m * stride_x_dim, mask=offs_m < dim, other=0.0)
     C = tl.load(
         C_ptr + offs_n * stride_C_dstate,
@@ -172,38 +274,114 @@ def _flashssm_state_and_output_kernel(
     )
     B_cur = tl.load(B_ptr + offs_n * stride_B_dstate, mask=offs_n < dstate, other=0.0)
 
-    x_all_ptrs = (
-        x_cache_ptr + offs_m[:, None] * stride_xc_dim
-        + offs_k[None, :] * stride_xc_pos
-    )
-    x_all = tl.load(
-        x_all_ptrs,
-        mask=(offs_m[:, None] < dim) & (offs_k[None, :] < write_pos),
-        other=0.0,
-    )
-    x_all = tl.where(offs_k[None, :] == write_pos, x_cur[:, None], x_all)
+    if not is_flush:
+        offs_k_cache = tl.arange(0, BLOCK_SIZE_K_CACHE)
+        dt_all_cache = tl.load(
+            dt_cache_ptr + offs_k_cache * stride_dtc_pos,
+            mask=offs_k_cache < write_pos,
+            other=0.0,
+        ).to(tl.float32)
+        dt_all_cache = tl.where(offs_k_cache == write_pos, dt_cur, dt_all_cache)
 
-    B_all_ptrs = (
-        B_cache_ptr + offs_k[:, None] * stride_Bc_pos
-        + offs_n[None, :] * stride_Bc_dstate
-    )
-    B_all = tl.load(
-        B_all_ptrs,
-        mask=(offs_k[:, None] < write_pos) & (offs_n[None, :] < dstate),
-        other=0.0,
-    )
-    B_all = tl.where(offs_k[:, None] == write_pos, B_cur[None, :], B_all)
+        dA_cumsum_cache = A * tl.cumsum(dt_all_cache, axis=0)
+        dA_total_cache = A * tl.sum(dt_all_cache, axis=0)
+        total_decay_cache = tl.exp(dA_total_cache)
+        scale_cache = dt_all_cache * tl.exp(dA_total_cache - dA_cumsum_cache)
+        scale_cache = tl.where(offs_k_cache <= write_pos, scale_cache, 0.0)
 
-    B_scaled = (B_all.to(tl.float32) * scale[:, None]).to(x_ptr.dtype.element_ty)
-    delta_state = tl.dot(x_all.to(x_ptr.dtype.element_ty), B_scaled)
-    state_new = state.to(tl.float32) * total_decay + delta_state.to(tl.float32)
-    if is_flush:
+        x_all_cache_ptrs = (
+            x_cache_ptr
+            + offs_m[:, None] * stride_xc_dim
+            + offs_k_cache[None, :] * stride_xc_pos
+        )
+        x_all_cache = tl.load(
+            x_all_cache_ptrs,
+            mask=(offs_m[:, None] < dim) & (offs_k_cache[None, :] < write_pos),
+            other=0.0,
+        )
+        x_all_cache = tl.where(
+            offs_k_cache[None, :] == write_pos, x_cur[:, None], x_all_cache
+        )
+
+        checkpoint_out = (
+            tl.sum(state.to(tl.float32) * C[None, :], axis=1) * total_decay_cache
+        )
+        BC_cache = tl.load(
+            BC_pre_ptr + offs_k_cache * stride_BC_pos,
+            mask=offs_k_cache <= write_pos,
+            other=0.0,
+        )
+        cache_out = tl.sum(
+            x_all_cache.to(tl.float32) * (scale_cache * BC_cache)[None, :], axis=1
+        )
+        out = checkpoint_out + cache_out
+        tl.store(
+            x_cache_ptr + offs_m * stride_xc_dim + write_pos * stride_xc_pos,
+            x_cur,
+            mask=offs_m < dim,
+        )
+        if pid_m == 0:
+            tl.store(dt_cache_ptr + write_pos * stride_dtc_pos, dt_cur)
+            tl.store(
+                B_cache_ptr + write_pos * stride_Bc_pos
+                + offs_n * stride_Bc_dstate,
+                B_cur,
+                mask=offs_n < dstate,
+            )
+    else:
+        offs_k_dot = tl.arange(0, BLOCK_SIZE_K_DOT)
+        dt_all_dot = tl.load(
+            dt_cache_ptr + offs_k_dot * stride_dtc_pos,
+            mask=offs_k_dot < write_pos,
+            other=0.0,
+        ).to(tl.float32)
+        dt_all_dot = tl.where(offs_k_dot == write_pos, dt_cur, dt_all_dot)
+
+        dA_cumsum_dot = A * tl.cumsum(dt_all_dot, axis=0)
+        dA_total_dot = A * tl.sum(dt_all_dot, axis=0)
+        total_decay_dot = tl.exp(dA_total_dot)
+        scale_dot = dt_all_dot * tl.exp(dA_total_dot - dA_cumsum_dot)
+        scale_dot = tl.where(offs_k_dot <= write_pos, scale_dot, 0.0)
+
+        x_all_dot_ptrs = (
+            x_cache_ptr
+            + offs_m[:, None] * stride_xc_dim
+            + offs_k_dot[None, :] * stride_xc_pos
+        )
+        x_all_dot = tl.load(
+            x_all_dot_ptrs,
+            mask=(offs_m[:, None] < dim) & (offs_k_dot[None, :] < write_pos),
+            other=0.0,
+        )
+        x_all_dot = tl.where(
+            offs_k_dot[None, :] == write_pos, x_cur[:, None], x_all_dot
+        )
+
+        B_all_dot_ptrs = (
+            B_cache_ptr
+            + offs_k_dot[:, None] * stride_Bc_pos
+            + offs_n[None, :] * stride_Bc_dstate
+        )
+        B_all_dot = tl.load(
+            B_all_dot_ptrs,
+            mask=(offs_k_dot[:, None] < write_pos) & (offs_n[None, :] < dstate),
+            other=0.0,
+        )
+        B_all_dot = tl.where(
+            offs_k_dot[:, None] == write_pos, B_cur[None, :], B_all_dot
+        )
+
+        B_scaled = (B_all_dot.to(tl.float32) * scale_dot[:, None]).to(
+            x_ptr.dtype.element_ty
+        )
+        delta_state = tl.dot(x_all_dot.to(x_ptr.dtype.element_ty), B_scaled)
+        state_new = state.to(tl.float32) * total_decay_dot + delta_state.to(tl.float32)
         tl.store(
             state_ptrs,
             state_new.to(state.dtype),
             mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
         )
-    out = tl.sum(state_new * C[None, :], axis=1)
+        out = tl.sum(state_new * C[None, :], axis=1)
 
     if HAS_D:
         D_ptr += pid_h * stride_D_head
@@ -225,31 +403,16 @@ def _flashssm_state_and_output_kernel(
 
     tl.store(out_ptr + offs_m * stride_out_dim, out, mask=offs_m < dim)
 
-    if not is_flush:
-        tl.store(
-            x_cache_ptr + offs_m * stride_xc_dim + write_pos * stride_xc_pos,
-            x_cur,
-            mask=offs_m < dim,
-        )
-        if pid_m == 0:
-            tl.store(dt_cache_ptr + write_pos * stride_dtc_pos, dt_cur)
-            tl.store(
-                B_cache_ptr + write_pos * stride_Bc_pos
-                + offs_n * stride_Bc_dstate,
-                B_cur,
-                mask=offs_n < dstate,
-            )
 
-
-def _get_flashssm_state_and_output_launch_config(dstate: int) -> tuple[int, int]:
+def _get_chunkdecode_output_only_launch_config(dstate: int) -> tuple[int, int]:
     if dstate <= 64:
         return 32, 4
     if dstate <= 128:
-        return 32, 1
+        return 16, 1
     return 16, 8
 
 
-def selective_state_update_flashssm_state_and_output(
+def selective_state_update_chunkdecode_output_only(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -263,6 +426,7 @@ def selective_state_update_flashssm_state_and_output(
     x_cache: torch.Tensor | None = None,
     dt_cache: torch.Tensor | None = None,
     B_cache: torch.Tensor | None = None,
+    bc_pre: torch.Tensor | None = None,
     write_pos: torch.Tensor | None = None,
     is_flush: torch.Tensor | None = None,
     max_cache_len: int = 16,
@@ -270,7 +434,7 @@ def selective_state_update_flashssm_state_and_output(
     null_block_id: int = NULL_BLOCK_ID,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Cached-dot SSM update for vLLM's autoregressive Mamba2 decode path."""
+    """Cached-bc SSM update for vLLM's autoregressive Mamba2 decode path."""
     has_heads = state.dim() > 3
     if state.dim() == 3:
         state = state.unsqueeze(1)
@@ -331,12 +495,17 @@ def selective_state_update_flashssm_state_and_output(
     assert write_pos.dtype == torch.int32
     assert is_flush is not None and is_flush.shape[0] >= batch
     assert is_flush.dtype in (torch.bool, torch.int8)
+    assert bc_pre is not None
+    assert bc_pre.shape[0] >= batch and bc_pre.shape[1] >= ngroups
+    assert bc_pre.shape[2] == max_cache_len
+    assert bc_pre.dtype == torch.float32
     if state_batch_indices is not None:
         assert state_batch_indices.shape[0] >= batch
         assert state_batch_indices.shape[1] >= 1
 
-    block_size_k = max(16, triton.next_power_of_2(max_cache_len))
-    block_size_m, num_warps = _get_flashssm_state_and_output_launch_config(dstate)
+    block_size_k_cache = max(1, triton.next_power_of_2(max_cache_len))
+    block_size_k_dot = max(16, block_size_k_cache)
+    block_size_m, num_warps = _get_chunkdecode_output_only_launch_config(dstate)
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
@@ -347,7 +516,38 @@ def selective_state_update_flashssm_state_and_output(
     )
 
     with torch.accelerator.device_index(x.device.index):
-        _flashssm_state_and_output_kernel[grid](
+        _chunkdecode_output_only_precompute_kernel[(batch, ngroups)](
+            B,
+            C,
+            B_cache,
+            write_pos,
+            is_flush,
+            bc_pre,
+            state_batch_indices,
+            null_block_id,
+            batch,
+            ngroups,
+            dstate,
+            B.stride(0),
+            B.stride(1),
+            B.stride(2),
+            C.stride(0),
+            C.stride(1),
+            C.stride(2),
+            B_cache.stride(0),
+            B_cache.stride(1),
+            B_cache.stride(2),
+            B_cache.stride(3),
+            bc_pre.stride(0),
+            bc_pre.stride(1),
+            bc_pre.stride(2),
+            state_indices_strides[0],
+            state_indices_strides[1],
+            max_cache_len,
+            block_size_k_cache,
+            num_warps=2,
+        )
+        _chunkdecode_output_only_kernel[grid](
             state,
             x,
             dt,
@@ -361,6 +561,7 @@ def selective_state_update_flashssm_state_and_output(
             x_cache,
             dt_cache,
             B_cache,
+            bc_pre,
             write_pos,
             is_flush,
             state_batch_indices,
@@ -406,12 +607,16 @@ def selective_state_update_flashssm_state_and_output(
             B_cache.stride(1),
             B_cache.stride(2),
             B_cache.stride(3),
+            bc_pre.stride(0),
+            bc_pre.stride(1),
+            bc_pre.stride(2),
             state_indices_strides[0],
             state_indices_strides[1],
             dt_softplus,
             max_cache_len,
             block_size_m,
-            block_size_k,
+            block_size_k_cache,
+            block_size_k_dot,
             num_warps=num_warps,
         )
 

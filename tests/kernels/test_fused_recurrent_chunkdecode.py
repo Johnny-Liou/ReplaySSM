@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fla.ops import (
-    fused_recurrent_gated_delta_rule_flashssm_decode,
+    fused_recurrent_gated_delta_rule_chunkdecode,
     fused_recurrent_gated_delta_rule_packed_decode,
 )
 
@@ -123,7 +123,7 @@ def _cached_decode_step(
         device=mixed_qkv.device,
         dtype=mixed_qkv.dtype,
     )
-    fused_recurrent_gated_delta_rule_flashssm_decode(
+    fused_recurrent_gated_delta_rule_chunkdecode(
         mixed_qkv=mixed_qkv,
         a=a,
         b=b,
@@ -145,7 +145,7 @@ def _cached_decode_step(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("strided_mixed_qkv", [False, True])
-def test_fused_recurrent_flashssm_decode_matches_packed_decode(
+def test_fused_recurrent_chunkdecode_matches_packed_decode(
     dtype: torch.dtype,
     strided_mixed_qkv: bool,
 ):
@@ -227,7 +227,7 @@ def test_fused_recurrent_flashssm_decode_matches_packed_decode(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_fused_recurrent_flashssm_decode_uses_per_row_write_pos(
+def test_fused_recurrent_chunkdecode_uses_per_row_write_pos(
     dtype: torch.dtype,
 ):
     torch.manual_seed(1)

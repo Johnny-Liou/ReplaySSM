@@ -193,7 +193,7 @@ def _fused_scatter_precompute_kernel(
     {"BLOCK_SIZE_DSTATE": lambda a: triton.next_power_of_2(a["dstate"])}
 )
 @triton.jit
-def _flashssm_spec_circular_kernel(
+def _chunkdecode_spec_circular_kernel(
     state_ptr,
     x_cache_ptr,
     dt_cache_ptr,
@@ -472,7 +472,7 @@ def _advance_write_pos_origin_kernel(
     # positions UNWRITTEN in the preallocated `out`, and the rejection sampler
     # (unaware of the truncation) then accepts garbage logits -> corrupted text +
     # acceptance collapse. Usable committed history becomes max_cache_len -
-    # 2*max_spec_len; raise flashssm_buffer_len for more. (Mirrors the GDN
+    # 2*max_spec_len; raise chunkdecode_buffer_len for more. (Mirrors the GDN
     # cached-spec fix; see CACHED_SPEC_GDN_INTEGRATION.md §10.3.)
     next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) >= MAX_CACHE_LEN).to(tl.int8)
     tl.store(post_origin_ptr + blk, new_origin, mask=valid)
@@ -481,7 +481,7 @@ def _advance_write_pos_origin_kernel(
 
 
 @triton.jit
-def _reset_flashssm_spec_cursors_kernel(
+def _reset_chunkdecode_spec_cursors_kernel(
     write_pos_ptr,
     post_origin_ptr,
     is_flush_ptr,
@@ -522,7 +522,7 @@ def _get_spec_launch_config(dstate: int, max_spec_len: int) -> tuple[int, int]:
     return bsm, nw
 
 
-def selective_state_update_flashssm_spec(
+def selective_state_update_chunkdecode_spec(
     state_checkpoint: torch.Tensor,  # (num_blocks, H, P, N) checkpoint (flush updates in place)
     post_conv_cache: torch.Tensor,  # (num_blocks, cache_buf_len, conv_dim) circular
     dt_cache: torch.Tensor,  # (num_blocks, H, cache_buf_len) circular
@@ -555,7 +555,7 @@ def selective_state_update_flashssm_spec(
     ``causal_conv1d_update`` (packed channel-last ``[total_tokens, conv_dim]``).
     Fuses scatter + CB-precompute in one ``(batch, ngroups)`` launch, then runs
     the circular scan. Cursors are block-keyed (indexed by
-    ``state_batch_indices``); the commit (``commit_flashssm_spec``) advances them
+    ``state_batch_indices``); the commit (``commit_chunkdecode_spec``) advances them
     once per step. Writes into the caller-supplied packed ``out``
     ``[total_tokens, H, P]``.
     """
@@ -666,7 +666,7 @@ def selective_state_update_flashssm_spec(
     )
     grid = lambda META: (triton.cdiv(headdim, META["BLOCK_SIZE_M"]), batch, nheads)
     with torch.cuda.device(state_checkpoint.device.index):
-        _flashssm_spec_circular_kernel[grid](
+        _chunkdecode_spec_circular_kernel[grid](
             state_checkpoint,
             x_view,
             dt_cache,
@@ -734,7 +734,7 @@ def selective_state_update_flashssm_spec(
     return out
 
 
-def commit_flashssm_spec(
+def commit_chunkdecode_spec(
     write_pos: torch.Tensor,
     post_conv_state_pos: torch.Tensor,
     is_flush: torch.Tensor,
@@ -772,7 +772,7 @@ def commit_flashssm_spec(
         )
 
 
-def reset_flashssm_spec_cursors(
+def reset_chunkdecode_spec_cursors(
     write_pos: torch.Tensor,
     post_conv_state_pos: torch.Tensor,
     is_flush: torch.Tensor,
@@ -790,7 +790,7 @@ def reset_flashssm_spec_cursors(
     # so the first decode after prefill agrees with the steady-state flush cadence.
     init_is_flush = 1 if 2 * max_spec_len >= max_cache_len else 0
     with torch.cuda.device(write_pos.device.index):
-        _reset_flashssm_spec_cursors_kernel[(1,)](
+        _reset_chunkdecode_spec_cursors_kernel[(1,)](
             write_pos,
             post_conv_state_pos,
             is_flush,
@@ -806,7 +806,7 @@ def reset_flashssm_spec_cursors(
 
 
 __all__ = [
-    "selective_state_update_flashssm_spec",
-    "commit_flashssm_spec",
-    "reset_flashssm_spec_cursors",
+    "selective_state_update_chunkdecode_spec",
+    "commit_chunkdecode_spec",
+    "reset_chunkdecode_spec_cursors",
 ]

@@ -51,16 +51,16 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         return MambaAttentionBackendEnum.GDN_ATTN
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
-        if self.cache_config.use_flashssm_spec:
+        if self.cache_config.use_chunkdecode_spec:
             return MambaStateDtypeCalculator.gated_delta_net_spec_cached_state_dtype(
                 self.model_config.dtype,
                 self.cache_config.mamba_cache_dtype,
                 self.cache_config.mamba_ssm_cache_dtype,
-                self.cache_config.use_flashssm_spec,
+                self.cache_config.use_chunkdecode_spec,
             )
         return MambaStateDtypeCalculator.gated_delta_net_cached_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
-            self.cache_config.use_flashssm,
+            self.cache_config.use_chunkdecode,
         )

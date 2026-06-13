@@ -113,10 +113,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         self.compilation_config = vllm_config.compilation_config
         self.num_spec_tokens: int = vllm_config.num_speculative_tokens
         self.use_spec_decode = self.num_spec_tokens > 0
-        self.use_cached_kernel = vllm_config.cache_config.use_flashssm
-        self.max_cache_len = vllm_config.cache_config.flashssm_buffer_len
+        self.use_cached_kernel = vllm_config.cache_config.use_chunkdecode
+        self.max_cache_len = vllm_config.cache_config.chunkdecode_buffer_len
         self.use_cache_spec_kernel = (
-            vllm_config.cache_config.use_flashssm_spec
+            vllm_config.cache_config.use_chunkdecode_spec
         )
         self.max_spec_len = 1 + self.num_spec_tokens
 
@@ -191,7 +191,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 device=device,
             )
             self.cached_kernel_variant: str = (
-                vllm_config.cache_config.flashssm_route
+                vllm_config.cache_config.chunkdecode_route
             )
             if self.cached_kernel_variant == "output_only":
                 # B_cache shape = (ngroups, max_cache_len, dstate). Index in
@@ -503,7 +503,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         if torch.any(prefill_to_decode).item():
             if self.use_cached_kernel and metadata.num_decodes > 0:
                 raise ValueError(
-                    "--use-flashssm does not support single-token "
+                    "--use-chunkdecode does not support single-token "
                     "prefill rows replayed through the decode path"
                 )
             is_prefilling = is_prefilling.clone()
@@ -630,7 +630,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
             if num_prompt_tokens_cpu is None or num_computed_tokens_cpu is None:
                 raise ValueError(
-                    "--use-flashssm requires CPU prompt and "
+                    "--use-chunkdecode requires CPU prompt and "
                     "computed-token counts to derive decode write positions"
                 )
             decode_steps_cpu = (
@@ -644,7 +644,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             valid_decode_rows = query_lens_cpu > 0
             if torch.any(decode_steps_cpu[valid_decode_rows] < 0).item():
                 raise ValueError(
-                    "--use-flashssm requires decode-step counts "
+                    "--use-chunkdecode requires decode-step counts "
                     "that exclude prompt tokens and start at zero"
                 )
             decode_steps_cpu = torch.where(
@@ -688,16 +688,16 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             and self.use_spec_decode
             and num_accepted_tokens is not None
         ):
-            from vllm.model_executor.layers.mamba.ops.selective_state_update_flashssm_spec import (  # noqa: E501
-                commit_flashssm_spec,
-                reset_flashssm_spec_cursors,
+            from vllm.model_executor.layers.mamba.ops.selective_state_update_chunkdecode_spec import (  # noqa: E501
+                commit_chunkdecode_spec,
+                reset_chunkdecode_spec_cursors,
             )
 
             cursor_device = common_attn_metadata.query_start_loc.device
             if self.spec_write_pos is None:
                 n_blocks = self.vllm_config.cache_config.num_gpu_blocks
                 assert n_blocks is not None and n_blocks > 0, (
-                    "--use-flashssm-spec needs num_gpu_blocks at "
+                    "--use-chunkdecode-spec needs num_gpu_blocks at "
                     "build time to size the block-keyed cursor buffers"
                 )
                 self.spec_write_pos = torch.zeros(
@@ -710,7 +710,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     n_blocks, dtype=torch.int8, device=cursor_device
                 )
             sbi = state_indices_tensor_d[:, 0]
-            commit_flashssm_spec(
+            commit_chunkdecode_spec(
                 self.spec_write_pos,
                 self.spec_post_origin,
                 self.spec_is_flush,
@@ -742,7 +742,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 first_decode_d = (
                     ctx_lens[:num_decodes] == num_prompt_d[:num_decodes]
                 ).to(torch.int8)
-                reset_flashssm_spec_cursors(
+                reset_chunkdecode_spec_cursors(
                     self.spec_write_pos,
                     self.spec_post_origin,
                     self.spec_is_flush,

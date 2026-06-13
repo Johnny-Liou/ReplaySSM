@@ -817,18 +817,18 @@ class NemotronHForCausalLM(
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, ...]:
         cache_config = vllm_config.cache_config
-        if cache_config.use_flashssm_spec:
+        if cache_config.use_chunkdecode_spec:
             return MambaStateDtypeCalculator.mamba2_spec_cached_state_dtype(
                 vllm_config.model_config.dtype,
                 cache_config.mamba_cache_dtype,
                 cache_config.mamba_ssm_cache_dtype,
-                use_flashssm_spec=cache_config.use_flashssm_spec,
+                use_chunkdecode_spec=cache_config.use_chunkdecode_spec,
             )
         return MambaStateDtypeCalculator.mamba2_cached_state_dtype(
             vllm_config.model_config.dtype,
             cache_config.mamba_cache_dtype,
             cache_config.mamba_ssm_cache_dtype,
-            use_flashssm=cache_config.use_flashssm,
+            use_chunkdecode=cache_config.use_chunkdecode,
         )
 
     @classmethod
@@ -853,7 +853,7 @@ class NemotronHForCausalLM(
         hf_config = vllm_config.model_config.hf_config
         intermediate_size = hf_config.mamba_num_heads * hf_config.mamba_head_dim
 
-        if cache_config.use_flashssm_spec:
+        if cache_config.use_chunkdecode_spec:
             return MambaStateShapeCalculator.mamba2_spec_cached_state_shape(
                 intermediate_size=intermediate_size,
                 tp_world_size=parallel_config.tensor_parallel_size,
@@ -863,8 +863,8 @@ class NemotronHForCausalLM(
                 state_size=hf_config.ssm_state_size,
                 conv_kernel=hf_config.conv_kernel,
                 num_spec=vllm_config.num_speculative_tokens,
-                use_flashssm_spec=cache_config.use_flashssm_spec,
-                flashssm_buffer_len=cache_config.flashssm_buffer_len,
+                use_chunkdecode_spec=cache_config.use_chunkdecode_spec,
+                chunkdecode_buffer_len=cache_config.chunkdecode_buffer_len,
             )
         return MambaStateShapeCalculator.mamba2_cached_state_shape(
             intermediate_size=intermediate_size,
@@ -875,8 +875,8 @@ class NemotronHForCausalLM(
             state_size=hf_config.ssm_state_size,
             conv_kernel=hf_config.conv_kernel,
             num_spec=vllm_config.num_speculative_tokens,
-            use_flashssm=cache_config.use_flashssm,
-            flashssm_buffer_len=cache_config.flashssm_buffer_len,
+            use_chunkdecode=cache_config.use_chunkdecode,
+            chunkdecode_buffer_len=cache_config.chunkdecode_buffer_len,
         )
 
     @classmethod

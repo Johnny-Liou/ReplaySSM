@@ -9,7 +9,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def gdn_flashssm_spec_circular_kernel(
+def gdn_chunkdecode_spec_circular_kernel(
     mixed_qkv,  # [total_tokens, qkv_dim]  packed, channel-last (q|k|v)
     a,  # [total_tokens, HV]
     b,  # [total_tokens, HV]
@@ -389,7 +389,7 @@ def _advance_gdn_spec_cursors_kernel(
     # sampler reads logits for EVERY window position -- so a truncated position
     # would feed the sampler an uninitialized-`out` garbage logit (emitting a
     # wrong token) and desync the committed state. Usable committed history is
-    # max_cache_len - 2*max_spec_len; raise flashssm_buffer_len for more.
+    # max_cache_len - 2*max_spec_len; raise chunkdecode_buffer_len for more.
     next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) >= MAX_CACHE_LEN).to(tl.int8)
 
     tl.store(write_pos_ptr + blk, new_wp, mask=valid)
@@ -398,7 +398,7 @@ def _advance_gdn_spec_cursors_kernel(
 
 
 @triton.jit
-def _reset_gdn_flashssm_spec_cursors_kernel(
+def _reset_gdn_chunkdecode_spec_cursors_kernel(
     write_pos_ptr,
     cache_base_ptr,
     is_flush_ptr,
@@ -484,7 +484,7 @@ def _launch_gdn_spec(
     BC = max(16, triton.next_power_of_2(max_cache_len))
 
     grid = (triton.cdiv(V, BV), B, HV)
-    gdn_flashssm_spec_circular_kernel[grid](
+    gdn_chunkdecode_spec_circular_kernel[grid](
         mixed_qkv,
         a,
         b,
@@ -532,7 +532,7 @@ def _launch_gdn_spec(
     )
 
 
-def gdn_flashssm_spec_decode(
+def gdn_chunkdecode_spec_decode(
     mixed_qkv: torch.Tensor,  # [total_tokens, qkv_dim]  post-conv packed (q|k|v)
     a: torch.Tensor,  # [total_tokens, HV]
     b: torch.Tensor,  # [total_tokens, HV]
@@ -569,7 +569,7 @@ def gdn_flashssm_spec_decode(
     Two launches (verify + flush ``IS_FLUSH`` specializations); device-side
     per-row routing keeps the step CUDA-graph capturable. Cursors are block-keyed
     (indexed by ``ssm_state_indices``) and advanced out-of-kernel by
-    :func:`commit_gdn_flashssm_spec`.
+    :func:`commit_gdn_chunkdecode_spec`.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
@@ -596,7 +596,7 @@ def gdn_flashssm_spec_decode(
     return out
 
 
-def commit_gdn_flashssm_spec(
+def commit_gdn_chunkdecode_spec(
     write_pos: torch.Tensor,
     cache_base: torch.Tensor,
     is_flush: torch.Tensor,
@@ -629,7 +629,7 @@ def commit_gdn_flashssm_spec(
     )
 
 
-def reset_gdn_flashssm_spec_cursors(
+def reset_gdn_chunkdecode_spec_cursors(
     write_pos: torch.Tensor,
     cache_base: torch.Tensor,
     is_flush: torch.Tensor,
@@ -644,7 +644,7 @@ def reset_gdn_flashssm_spec_cursors(
     BLOCK = triton.next_power_of_2(max(1, n_rows))
     # Early-flush margin (2 * max_spec_len): mirror _advance_gdn_spec_cursors_kernel.
     init_flush = 1 if 2 * max_spec_len >= max_cache_len else 0
-    _reset_gdn_flashssm_spec_cursors_kernel[(1,)](
+    _reset_gdn_chunkdecode_spec_cursors_kernel[(1,)](
         write_pos,
         cache_base,
         is_flush,

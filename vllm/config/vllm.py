@@ -2127,71 +2127,71 @@ class VllmConfig:
 
     @model_validator(mode="after")
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
-        if not self.cache_config.use_flashssm:
-            if self.cache_config.flashssm_route != "output_only":
+        if not self.cache_config.use_chunkdecode:
+            if self.cache_config.chunkdecode_route != "output_only":
                 raise ValueError(
-                    "--flashssm-route is only meaningful when "
-                    "--use-flashssm is enabled"
+                    "--chunkdecode-route is only meaningful when "
+                    "--use-chunkdecode is enabled"
                 )
             return self
         if self.cache_config.mamba_cache_mode != "none":
             raise ValueError(
-                "--use-flashssm requires --mamba-cache-mode none"
+                "--use-chunkdecode requires --mamba-cache-mode none"
             )
         if self.num_speculative_tokens > 0:
             raise ValueError(
-                "--use-flashssm does not support speculative decoding"
+                "--use-chunkdecode does not support speculative decoding"
             )
         if self.mamba_config.backend != MambaBackendEnum.TRITON:
             raise ValueError(
-                "--use-flashssm requires --mamba-backend triton"
+                "--use-chunkdecode requires --mamba-backend triton"
             )
         if self.mamba_config.enable_stochastic_rounding:
             raise ValueError(
-                "--use-flashssm does not support Mamba cache "
+                "--use-chunkdecode does not support Mamba cache "
                 "stochastic rounding"
             )
         return self
 
     @model_validator(mode="after")
     def validate_mamba_cached_spec_kernel(self) -> "VllmConfig":
-        if not self.cache_config.use_flashssm_spec:
+        if not self.cache_config.use_chunkdecode_spec:
             return self
         # Inverted guard: the cached-SPEC kernel *requires* speculative decode
-        # (the opposite of --use-flashssm, which forbids it).
-        if self.cache_config.use_flashssm:
+        # (the opposite of --use-chunkdecode, which forbids it).
+        if self.cache_config.use_chunkdecode:
             raise ValueError(
-                "--use-flashssm-spec is mutually exclusive with "
-                "--use-flashssm (different page shapes / decode paths)"
+                "--use-chunkdecode-spec is mutually exclusive with "
+                "--use-chunkdecode (different page shapes / decode paths)"
             )
         if self.num_speculative_tokens <= 0:
             raise ValueError(
-                "--use-flashssm-spec requires speculative decoding "
+                "--use-chunkdecode-spec requires speculative decoding "
                 "(num_speculative_tokens > 0)"
             )
         if self.cache_config.mamba_cache_mode != "none":
             raise ValueError(
-                "--use-flashssm-spec requires --mamba-cache-mode none"
+                "--use-chunkdecode-spec requires --mamba-cache-mode none"
             )
         if self.mamba_config.backend != MambaBackendEnum.TRITON:
             raise ValueError(
-                "--use-flashssm-spec requires --mamba-backend triton"
+                "--use-chunkdecode-spec requires --mamba-backend triton"
             )
         if self.mamba_config.enable_stochastic_rounding:
             raise ValueError(
-                "--use-flashssm-spec does not support Mamba cache "
+                "--use-chunkdecode-spec does not support Mamba cache "
                 "stochastic rounding"
             )
-        max_cache_len = self.cache_config.flashssm_buffer_len
+        max_cache_len = self.cache_config.chunkdecode_buffer_len
         max_spec_len = 1 + self.num_speculative_tokens
         if max_cache_len < max_spec_len:
             raise ValueError(
-                "--use-flashssm-spec requires --flashssm-buffer-len "
+                "--use-chunkdecode-spec requires --chunkdecode-buffer-len "
                 f">= 1 + num_speculative_tokens ({max_spec_len}); got {max_cache_len}"
             )
         if max_cache_len & (max_cache_len - 1) != 0:
             raise ValueError(
-                "--use-flashssm-spec requires --flashssm-buffer-len to "
+                "--use-chunkdecode-spec requires --chunkdecode-buffer-len to "
                 f"be a power of two (circular-cache bitmask index); got {max_cache_len}"
             )
         return self

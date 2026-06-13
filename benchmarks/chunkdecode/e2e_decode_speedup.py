@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end autoregressive decode benchmark: FlashSSM vs the standard SSM kernel.
+"""End-to-end autoregressive decode benchmark: ChunkDecode vs the standard SSM kernel.
 
 Loads a hybrid SSM model, replicates one prompt across the batch, and times a
 long greedy decode (CUDA graphs on) once with the standard kernel and once with
-FlashSSM, then reports the per-step / throughput speedup. Works for any hybrid
+ChunkDecode, then reports the per-step / throughput speedup. Works for any hybrid
 SSM model supported by vLLM (Mamba2 or GDN). The two modes run in separate
 subprocesses so each gets a clean CUDA context.
 
@@ -33,12 +33,12 @@ import time
 
 DEFAULT_PROMPT = "My cat wrote all this CUDA code for a new language model and"
 
-MODE_LABEL = {"standard": "standard", "flashssm": "FlashSSM"}
+MODE_LABEL = {"standard": "standard", "chunkdecode": "ChunkDecode"}
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="E2E decode speedup: FlashSSM vs the standard SSM kernel."
+        description="E2E decode speedup: ChunkDecode vs the standard SSM kernel."
     )
     p.add_argument("--model-id", default="nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16")
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -47,7 +47,7 @@ def parse_args():
     p.add_argument("--warmup-steps", type=int, default=128)
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--buffer-len", type=int, default=8,
-                   help="FlashSSM input-buffer length (8 for Mamba2, 16 for GDN).")
+                   help="ChunkDecode input-buffer length (8 for Mamba2, 16 for GDN).")
     p.add_argument("--dtype", default="bfloat16",
                    choices=["bfloat16", "float16", "float32", "auto"])
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -64,7 +64,7 @@ def parse_args():
                         "It is unstable under CUDA-graph capture on the "
                         "pre-release Blackwell FP4 path; pass "
                         "--no-disable-flashinfer-autotune for non-FP4 models.")
-    p.add_argument("--worker", choices=["standard", "flashssm"], default=None,
+    p.add_argument("--worker", choices=["standard", "chunkdecode"], default=None,
                    help=argparse.SUPPRESS)
     return p.parse_args()
 
@@ -106,9 +106,9 @@ def run_worker(args):
         # FP4-MoE autotuner is unstable under CUDA-graph capture on Blackwell;
         # re-enable (--no-disable-flashinfer-autotune) only for non-FP4 models.
         llm_kwargs["kernel_config"] = {"enable_flashinfer_autotune": False}
-    if mode == "flashssm":
-        llm_kwargs.update(use_flashssm=True, flashssm_buffer_len=args.buffer_len,
-                          flashssm_route="output_only")  # ignored by GDN models
+    if mode == "chunkdecode":
+        llm_kwargs.update(use_chunkdecode=True, chunkdecode_buffer_len=args.buffer_len,
+                          chunkdecode_route="output_only")  # ignored by GDN models
 
     llm = LLM(**llm_kwargs)
     prompts = [args.prompt] * args.batch_size
@@ -186,7 +186,7 @@ def main():
           f"steps={args.num_steps}  buffer_len={args.buffer_len}  dtype={args.dtype}")
 
     std = run_one_mode(args, "standard")
-    fla = run_one_mode(args, "flashssm")
+    fla = run_one_mode(args, "chunkdecode")
     speedup = std["per_step_ms"] / fla["per_step_ms"]
 
     print()
@@ -197,7 +197,7 @@ def main():
         print(f"{MODE_LABEL[r['mode']]:<10}{r['per_step_ms']:>12.3f}"
               f"{r['tok_s']:>16,.0f}{r['elapsed_s']:>12.3f}")
     print("-" * len(header))
-    print(f"speedup (standard / FlashSSM, per step): {speedup:.3f}x")
+    print(f"speedup (standard / ChunkDecode, per step): {speedup:.3f}x")
 
 
 if __name__ == "__main__":

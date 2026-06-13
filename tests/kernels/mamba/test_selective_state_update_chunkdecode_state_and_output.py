@@ -6,11 +6,11 @@ import torch
 
 from tests.kernels.mamba.utils import (
     allocate_update_caches,
-    selective_state_update_flashssm_output_only_ref,
+    selective_state_update_chunkdecode_state_and_output_ref,
 )
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import selective_state_update
-from vllm.model_executor.layers.mamba.ops.selective_state_update_flashssm_output_only import (
-    selective_state_update_flashssm_output_only,
+from vllm.model_executor.layers.mamba.ops.selective_state_update_chunkdecode_state_and_output import (
+    selective_state_update_chunkdecode_state_and_output,
 )
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -48,7 +48,7 @@ def _tied_dt_bias(nheads: int, headdim: int, device: str) -> torch.Tensor:
 @pytest.mark.parametrize("ngroups", [1, 4])
 @pytest.mark.parametrize("dstate", [16, 64])
 @pytest.mark.parametrize("max_cache_len", [1, 4])
-def test_selective_state_update_flashssm_output_only_matches_baseline_decode(
+def test_selective_state_update_chunkdecode_state_and_output_matches_baseline_decode(
     max_cache_len: int,
     dstate: int,
     ngroups: int,
@@ -79,8 +79,6 @@ def test_selective_state_update_flashssm_output_only_matches_baseline_decode(
     x_cache_ref, dt_cache_ref, B_cache_ref, write_pos_ref = allocate_update_caches(
         batch, nheads, ngroups, headdim, dstate, max_cache_len, state.device, itype,
         itype)
-    bc_pre = torch.empty(
-        batch, ngroups, max_cache_len, device=device, dtype=torch.float32)
 
     for _ in range(num_steps):
         x = torch.randn(batch, nheads, headdim, device=device, dtype=itype)
@@ -106,7 +104,7 @@ def test_selective_state_update_flashssm_output_only_matches_baseline_decode(
 
         out_cached = torch.empty_like(x)
         is_flush = write_pos == max_cache_len - 1
-        selective_state_update_flashssm_output_only(
+        selective_state_update_chunkdecode_state_and_output(
             state_cached,
             x,
             dt,
@@ -120,14 +118,13 @@ def test_selective_state_update_flashssm_output_only_matches_baseline_decode(
             x_cache=x_cache,
             dt_cache=dt_cache,
             B_cache=B_cache,
-            bc_pre=bc_pre,
             write_pos=write_pos,
             is_flush=is_flush,
             max_cache_len=max_cache_len,
             out=out_cached,
         )
 
-        out_ref = selective_state_update_flashssm_output_only_ref(
+        out_ref = selective_state_update_chunkdecode_state_and_output_ref(
             state_ref,
             x,
             dt,
@@ -165,7 +162,7 @@ def test_selective_state_update_flashssm_output_only_matches_baseline_decode(
 
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("with_padding", [False, True])
-def test_selective_state_update_flashssm_output_only_with_batch_indices(
+def test_selective_state_update_chunkdecode_state_and_output_with_batch_indices(
     with_padding: bool,
     itype: torch.dtype,
 ):
@@ -209,8 +206,6 @@ def test_selective_state_update_flashssm_output_only_with_batch_indices(
         total_state_slots, nheads, max_cache_len, device=device, dtype=torch.float32)
     B_cache = torch.zeros(
         total_state_slots, ngroups, max_cache_len, dstate, device=device, dtype=itype)
-    bc_pre = torch.empty(
-        padded_batch, ngroups, max_cache_len, device=device, dtype=torch.float32)
     write_pos = torch.zeros(padded_batch, dtype=torch.int32, device=device)
 
     for _ in range(num_steps):
@@ -238,7 +233,7 @@ def test_selective_state_update_flashssm_output_only_with_batch_indices(
 
         out_cached = torch.full_like(x, 42)
         is_flush = write_pos == max_cache_len - 1
-        selective_state_update_flashssm_output_only(
+        selective_state_update_chunkdecode_state_and_output(
             state_cached,
             x,
             dt,
@@ -252,7 +247,6 @@ def test_selective_state_update_flashssm_output_only_with_batch_indices(
             x_cache=x_cache,
             dt_cache=dt_cache,
             B_cache=B_cache,
-            bc_pre=bc_pre,
             write_pos=write_pos,
             is_flush=is_flush,
             max_cache_len=max_cache_len,
