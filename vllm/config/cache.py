@@ -34,6 +34,7 @@ CacheDType = Literal[
 ]
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
+ChunkDecodeRoute = Literal["state_and_output", "output_only"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
@@ -138,6 +139,28 @@ class CacheConfig:
     - "align": only cache the mamba state of the last token of each scheduler step and
            when the token is at position i * block_size.
     """
+    chunkdecode_buffer_len: int = Field(default=16, gt=0)
+    """ChunkDecode input-buffer capacity: the maximum number of autoregressive
+    Mamba2 decode steps to accumulate in the ring buffer before flushing the
+    checkpoint state."""
+    use_chunkdecode: bool = False
+    """Use the ChunkDecode Mamba2 decode kernel (cache recent SSM inputs instead
+    of writing the recurrent state back to HBM each step). Only supported for
+    autoregressive decode with mamba_cache_mode='none'."""
+    chunkdecode_route: ChunkDecodeRoute = "output_only"
+    """ChunkDecode compute route (only meaningful when use_chunkdecode is True):
+    - "output_only" (default): inner-product route. Computes the output from
+       the checkpoint state plus the cached inputs without materializing the
+       per-step state (the state is only built on flush steps).
+    - "state_and_output": outer-product route. Reconstructs the full SSM state
+       every step via tl.dot, then reads the output from it."""
+    use_chunkdecode_spec: bool = False
+    """Use the ChunkDecode speculative-decode Mamba2 kernel (circular post-conv
+    cache + truncation). Requires speculative decoding and
+    mamba_cache_mode='none'; reuses vLLM's causal_conv1d_update for the conv
+    (hybrid). Mutually exclusive with use_chunkdecode. The window cap uses
+    chunkdecode_buffer_len, which must be a power of two and >= 1 +
+    num_speculative_tokens."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
