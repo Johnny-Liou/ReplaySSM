@@ -9,7 +9,7 @@
 > small ring buffer instead of writing the recurrent **state** back to HBM every
 > decode step.
 >
-> 📝 **Blog post:** [ChunkDecode: Cache SSM Inputs, Not State](<>) &nbsp;·&nbsp; built on vLLM
+> 📝 **Blog post:** [ChunkDecode: Cache SSM Inputs, Not State](https://dao-lab.ai/blog/2026/chunkdecode/) &nbsp;·&nbsp; built on vLLM
 > (Apache-2.0); see the upstream README below for general install and usage.
 
 ## Try it out
