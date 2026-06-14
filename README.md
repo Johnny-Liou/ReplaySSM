@@ -1,4 +1,65 @@
 <!-- markdownlint-disable MD001 MD041 -->
+<!-- ===================== ReplaySSM fork ===================== -->
+# ReplaySSM (a vLLM fork)
+
+> A fork of [vLLM](https://github.com/vllm-project/vllm) (based on upstream commit
+> [`193ce8812`](https://github.com/vllm-project/vllm/commit/193ce8812)) adding
+> **ReplaySSM**: faster autoregressive **and** speculative decoding for hybrid
+> models (with Mamba2, Gated DeltaNet) by caching recent SSM **inputs** in a
+> small ring buffer instead of writing the recurrent **state** back to HBM every
+> decode step.
+>
+> 📝 **Blog post:** [ReplaySSM: Cache SSM Inputs, Not State](https://dao-lab.ai/blog/2026/replayssm/) &nbsp;·&nbsp; built on vLLM
+> (Apache-2.0); see the upstream README below for general install and usage.
+
+## Try it out
+
+Scripts under [`benchmarks/replayssm/`](benchmarks/replayssm/) reproduce the blog numbers:
+
+```bash
+# E2E autoregressive decode speedup: ReplaySSM vs the standard SSM kernel (on single H100)
+python benchmarks/replayssm/e2e_decode_speedup.py --model-id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 
+python benchmarks/replayssm/e2e_decode_speedup.py --model-id Qwen/Qwen3.5-4B --buffer-len 16
+
+# E2E speculative-decode throughput: AR vs standard-spec vs ReplaySSM-spec (on single B300)
+python benchmarks/replayssm/e2e_spec_decode_throughput.py --batch-size 512 \
+    --model-id nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+python benchmarks/replayssm/e2e_spec_decode_throughput.py --batch-size 512 \
+    --model-id nvidia/Qwen3.5-122B-A10B-NVFP4 --spec-method qwen3_next_mtp
+```
+> **Blackwell / NVFP4 note:** the FP4-MoE FlashInfer autotuner can be unstable under
+> CUDA-graph capture on the pre-release Blackwell path, so the benchmark scripts disable
+> it by default (override with `--no-disable-flashinfer-autotune`).
+
+<br>
+
+| flag | meaning & constraints |
+|---|---|
+| `--use-replayssm` | ReplaySSM AR decode kernel. AR only |
+| `--use-replayssm-spec` | ReplaySSM cached spec kernel. |
+| `--replayssm-buffer-len N` | ring-buffer capacity. |
+| `--replayssm-route {output_only,state_and_output}` | AR compute route (only with `--use-replayssm`); default `output_only`. |
+
+
+
+## Core implementation files
+
+ReplaySSM is implemented in Triton kernels.
+
+**Kernels — Mamba2** (`vllm/model_executor/layers/mamba/ops/`)
+- [`selective_state_update_replayssm_output_only.py`](vllm/model_executor/layers/mamba/ops/selective_state_update_replayssm_output_only.py) — AR decode, `output_only` route (default). Entry: `selective_state_update_replayssm_output_only`.
+- [`selective_state_update_replayssm_state_and_output.py`](vllm/model_executor/layers/mamba/ops/selective_state_update_replayssm_state_and_output.py) — AR decode, `state_and_output` route. Entry: `selective_state_update_replayssm_state_and_output`.
+- [`selective_state_update_replayssm_spec.py`](vllm/model_executor/layers/mamba/ops/selective_state_update_replayssm_spec.py) — speculative decode on a circular buffer. Entry: `selective_state_update_replayssm_spec`; cursors `commit_replayssm_spec` / `reset_replayssm_spec_cursors`.
+
+**Kernels — Gated DeltaNet (GDN)** (`vllm/model_executor/layers/fla/ops/`)
+- [`fused_recurrent_replayssm.py`](vllm/model_executor/layers/fla/ops/fused_recurrent_replayssm.py) — AR decode. Entry: `fused_recurrent_gated_delta_rule_replayssm`.
+- [`gdn_replayssm_spec_decode.py`](vllm/model_executor/layers/fla/ops/gdn_replayssm_spec_decode.py) — speculative decode on a circular buffer. Entry: `gdn_replayssm_spec_decode`; cursors `commit_gdn_replayssm_spec` / `reset_gdn_replayssm_spec_cursors`.
+
+---
+
+<sub>Everything below is the upstream vLLM README.</sub>
+<!-- ===================== end ReplaySSM fork ===================== -->
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
