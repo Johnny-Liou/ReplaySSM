@@ -21,7 +21,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])}
 )
 @triton.jit
-def _chunkdecode_state_and_output_kernel(
+def _replayssm_state_and_output_kernel(
     # Pointers to matrices
     state_ptr,
     x_ptr,
@@ -241,7 +241,7 @@ def _chunkdecode_state_and_output_kernel(
             )
 
 
-def _get_chunkdecode_state_and_output_launch_config(dstate: int) -> tuple[int, int]:
+def _get_replayssm_state_and_output_launch_config(dstate: int) -> tuple[int, int]:
     if dstate <= 64:
         return 32, 4
     if dstate <= 128:
@@ -249,7 +249,7 @@ def _get_chunkdecode_state_and_output_launch_config(dstate: int) -> tuple[int, i
     return 16, 8
 
 
-def selective_state_update_chunkdecode_state_and_output(
+def selective_state_update_replayssm_state_and_output(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -336,7 +336,7 @@ def selective_state_update_chunkdecode_state_and_output(
         assert state_batch_indices.shape[1] >= 1
 
     block_size_k = max(16, triton.next_power_of_2(max_cache_len))
-    block_size_m, num_warps = _get_chunkdecode_state_and_output_launch_config(dstate)
+    block_size_m, num_warps = _get_replayssm_state_and_output_launch_config(dstate)
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
@@ -347,7 +347,7 @@ def selective_state_update_chunkdecode_state_and_output(
     )
 
     with torch.accelerator.device_index(x.device.index):
-        _chunkdecode_state_and_output_kernel[grid](
+        _replayssm_state_and_output_kernel[grid](
             state,
             x,
             dt,

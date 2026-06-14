@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end speculative-decode throughput: AR vs standard spec vs ChunkDecode spec.
+"""End-to-end speculative-decode throughput: AR vs standard spec vs ReplaySSM spec.
 
 Real GSM8K prompts (chat-formatted) at a fixed batch size, CUDA graphs on, with
 ignore_eos so every mode emits exactly --max-tokens tokens per sequence, making
 tokens/s directly comparable. Reports throughput, mean acceptance length, and
-the ChunkDecode-spec speedup over both baselines.
+the ReplaySSM-spec speedup over both baselines.
 
   ar       : no speculative decoding
   standard : vLLM native spec decoding (one recurrent state per draft token)
-  cache    : ChunkDecode cached spec decoding (use_chunkdecode_spec)
+  cache    : ReplaySSM cached spec decoding (use_replayssm_spec)
 
 Each mode runs in its own subprocess for a clean CUDA context.
 
@@ -30,12 +30,12 @@ import subprocess
 import sys
 import time
 
-MODE_LABEL = {"ar": "AR", "standard": "standard-spec", "cache": "ChunkDecode-spec"}
+MODE_LABEL = {"ar": "AR", "standard": "standard-spec", "cache": "ReplaySSM-spec"}
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="E2E spec-decode throughput: AR vs standard vs ChunkDecode."
+        description="E2E spec-decode throughput: AR vs standard vs ReplaySSM."
     )
     p.add_argument("--model-id",
                    default="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4")
@@ -45,7 +45,7 @@ def parse_args():
                    help="Draft tokens per step (spec window = num_spec + 1).")
     p.add_argument("--spec-method", default="mtp")
     p.add_argument("--buffer-len", type=int, default=16,
-                   help="ChunkDecode buffer length (power of two, >= 1 + num_spec).")
+                   help="ReplaySSM buffer length (power of two, >= 1 + num_spec).")
     p.add_argument("--max-tokens", type=int, default=256)
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--dtype", default="auto")
@@ -122,8 +122,8 @@ def run_worker(args):
             "num_speculative_tokens": args.num_spec,
         }
     if mode == "cache":
-        llm_kwargs["use_chunkdecode_spec"] = True
-        llm_kwargs["chunkdecode_buffer_len"] = args.buffer_len
+        llm_kwargs["use_replayssm_spec"] = True
+        llm_kwargs["replayssm_buffer_len"] = args.buffer_len
 
     llm = LLM(**llm_kwargs)
     messages = gsm8k_messages(args.batch_size)
@@ -223,10 +223,10 @@ def main():
         print(f"{MODE_LABEL[m]:<16}{r['tok_s']:>14,.0f}{al:>12}{r['elapsed_s']:>12.2f}")
     print("-" * len(header))
     if "cache" in results and "standard" in results:
-        print(f"ChunkDecode / standard : "
+        print(f"ReplaySSM / standard : "
               f"{results['cache']['tok_s'] / results['standard']['tok_s']:.2f}x")
     if "cache" in results and "ar" in results:
-        print(f"ChunkDecode / AR       : "
+        print(f"ReplaySSM / AR       : "
               f"{results['cache']['tok_s'] / results['ar']['tok_s']:.2f}x")
 
 

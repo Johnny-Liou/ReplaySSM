@@ -86,12 +86,12 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType,
-        use_chunkdecode: bool,
+        use_replayssm: bool,
     ) -> tuple[torch.dtype, ...]:
         """Mamba2 state dtypes, extended for the state-and-output decode kernel.
 
         Returns the baseline ``(conv, ssm)`` dtypes when
-        ``use_chunkdecode`` is ``False``; otherwise appends the
+        ``use_replayssm`` is ``False``; otherwise appends the
         state-and-output ring-buffer dtypes ``(x_cache, dt_cache, B_cache)`` =
         ``(activation, fp32, activation)``. Must stay in sync with
         ``MambaMixer2.get_state_dtype``.
@@ -99,7 +99,7 @@ class MambaStateDtypeCalculator:
         conv_dtype, ssm_dtype = cls.mamba2_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
-        if not use_chunkdecode:
+        if not use_replayssm:
             return conv_dtype, ssm_dtype
         activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
         return conv_dtype, ssm_dtype, activation_dtype, torch.float32, activation_dtype
@@ -110,7 +110,7 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType,
-        use_chunkdecode_spec: bool,
+        use_replayssm_spec: bool,
     ) -> tuple[torch.dtype, ...]:
         """Mamba2 state dtypes for the cached SPECULATIVE-decode (hybrid) kernel.
 
@@ -123,7 +123,7 @@ class MambaStateDtypeCalculator:
         conv_dtype, _ssm_dtype = cls.mamba2_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
-        if not use_chunkdecode_spec:
+        if not use_replayssm_spec:
             return conv_dtype, _ssm_dtype
         activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
         return conv_dtype, torch.float32, activation_dtype, torch.float32
@@ -169,19 +169,19 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType,
-        use_chunkdecode: bool,
+        use_replayssm: bool,
     ) -> tuple[torch.dtype, ...]:
         """GDN state dtypes, extended for the cached decode kernel.
 
         Returns the baseline ``(conv, ssm)`` dtypes when
-        ``use_chunkdecode`` is ``False``; otherwise appends the ring
+        ``use_replayssm`` is ``False``; otherwise appends the ring
         cache dtypes ``(d_cache, k_cache, g_cache)`` =
         ``(activation, activation, float32)``.
         """
         conv_dtype, ssm_dtype = cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
-        if not use_chunkdecode:
+        if not use_replayssm:
             return conv_dtype, ssm_dtype
         activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
         return conv_dtype, ssm_dtype, activation_dtype, activation_dtype, torch.float32
@@ -192,7 +192,7 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType,
-        use_chunkdecode_spec: bool,
+        use_replayssm_spec: bool,
     ) -> tuple[torch.dtype, ...]:
         """GDN state dtypes for the cached SPECULATIVE-decode kernel.
 
@@ -205,7 +205,7 @@ class MambaStateDtypeCalculator:
         conv_dtype, ssm_dtype = cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
-        if not use_chunkdecode_spec:
+        if not use_replayssm_spec:
             return conv_dtype, ssm_dtype
         activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
         return (
@@ -297,14 +297,14 @@ class MambaStateShapeCalculator:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
-        use_chunkdecode: bool,
-        chunkdecode_buffer_len: int,
+        use_replayssm: bool,
+        replayssm_buffer_len: int,
         num_spec: int = 0,
     ) -> tuple[tuple[int, ...], ...]:
         """Mamba2 state shapes, extended for the state-and-output decode kernel.
 
         Returns the baseline ``(conv, ssm)`` shapes when
-        ``use_chunkdecode`` is ``False``; otherwise appends the
+        ``use_replayssm`` is ``False``; otherwise appends the
         state-and-output ring-buffer shapes ``x_cache``/``dt_cache``/``B_cache``.
         Group/head counts use the (un-extended) ``n_groups``/``num_heads``
         divided by ``tp_world_size``, matching ``MambaMixer2.get_state_shape``.
@@ -319,14 +319,14 @@ class MambaStateShapeCalculator:
             conv_kernel=conv_kernel,
             num_spec=num_spec,
         )
-        if not use_chunkdecode:
+        if not use_replayssm:
             return conv_state_shape, temporal_state_shape
 
         local_nheads = divide(num_heads, tp_world_size)
         local_ngroups = divide(n_groups, tp_world_size)
-        x_cache_shape = (local_nheads, chunkdecode_buffer_len, head_dim)
-        dt_cache_shape = (local_nheads, chunkdecode_buffer_len)
-        B_cache_shape = (local_ngroups, chunkdecode_buffer_len, state_size)
+        x_cache_shape = (local_nheads, replayssm_buffer_len, head_dim)
+        dt_cache_shape = (local_nheads, replayssm_buffer_len)
+        B_cache_shape = (local_ngroups, replayssm_buffer_len, state_size)
         return (
             conv_state_shape,
             temporal_state_shape,
@@ -345,8 +345,8 @@ class MambaStateShapeCalculator:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
-        use_chunkdecode_spec: bool,
-        chunkdecode_buffer_len: int,
+        use_replayssm_spec: bool,
+        replayssm_buffer_len: int,
         num_spec: int = 0,
     ) -> tuple[tuple[int, ...], ...]:
         """Mamba2 state shapes for the cached SPECULATIVE-decode (hybrid) kernel.
@@ -356,7 +356,7 @@ class MambaStateShapeCalculator:
         ``causal_conv1d_update``); otherwise appends the circular caches
         ``post_conv_cache=(cache_buf_len, conv_dim_local)`` and
         ``dt_cache=(local_nheads, cache_buf_len)``, where
-        ``cache_buf_len = next_pow2(chunkdecode_buffer_len)`` and ``conv_dim_local``
+        ``cache_buf_len = next_pow2(replayssm_buffer_len)`` and ``conv_dim_local``
         matches the post-conv x|B|C width. Must stay in sync with
         ``MambaMixer2.get_state_shape``.
         """
@@ -370,7 +370,7 @@ class MambaStateShapeCalculator:
             conv_kernel=conv_kernel,
             num_spec=num_spec,
         )
-        if not use_chunkdecode_spec:
+        if not use_replayssm_spec:
             return conv_state_shape, temporal_state_shape
         n_groups_ext = n_groups + cls.extra_groups_for_head_shards(
             n_groups, tp_world_size
@@ -378,7 +378,7 @@ class MambaStateShapeCalculator:
         conv_dim_local = divide(
             intermediate_size + 2 * n_groups_ext * state_size, tp_world_size
         )
-        cache_buf_len = 1 << (chunkdecode_buffer_len - 1).bit_length()
+        cache_buf_len = 1 << (replayssm_buffer_len - 1).bit_length()
         local_nheads = divide(num_heads, tp_world_size)
         post_conv_cache_shape = (cache_buf_len, conv_dim_local)
         dt_cache_shape = (local_nheads, cache_buf_len)
@@ -445,14 +445,14 @@ class MambaStateShapeCalculator:
         head_k_dim: int,
         head_v_dim: int,
         conv_kernel_size: int,
-        use_chunkdecode: bool,
-        chunkdecode_buffer_len: int,
+        use_replayssm: bool,
+        replayssm_buffer_len: int,
         num_spec: int = 0,
     ) -> tuple[tuple[int, ...], ...]:
         """GDN state shapes, extended for the cached decode kernel.
 
         Returns the baseline ``(conv, ssm)`` shapes when
-        ``use_chunkdecode`` is ``False``; otherwise appends the cached
+        ``use_replayssm`` is ``False``; otherwise appends the cached
         ring-buffer shapes ``d_cache``/``k_cache``/``g_cache``. Head counts use
         the (un-extended) ``num_v_heads``/``num_k_heads`` divided by
         ``tp_world_size``, matching ``gated_delta_net_state_shape``.
@@ -466,14 +466,14 @@ class MambaStateShapeCalculator:
             conv_kernel_size,
             num_spec,
         )
-        if not use_chunkdecode:
+        if not use_replayssm:
             return conv_state_shape, temporal_state_shape
 
         local_v_heads = divide(num_v_heads, tp_world_size)
         local_k_heads = divide(num_k_heads, tp_world_size)
-        d_cache_shape = (local_v_heads, chunkdecode_buffer_len, head_v_dim)
-        k_cache_shape = (local_k_heads, chunkdecode_buffer_len, head_k_dim)
-        g_cache_shape = (local_v_heads, chunkdecode_buffer_len)
+        d_cache_shape = (local_v_heads, replayssm_buffer_len, head_v_dim)
+        k_cache_shape = (local_k_heads, replayssm_buffer_len, head_k_dim)
+        g_cache_shape = (local_v_heads, replayssm_buffer_len)
         return (
             conv_state_shape,
             temporal_state_shape,
@@ -491,8 +491,8 @@ class MambaStateShapeCalculator:
         head_k_dim: int,
         head_v_dim: int,
         conv_kernel_size: int,
-        use_chunkdecode_spec: bool,
-        chunkdecode_buffer_len: int,
+        use_replayssm_spec: bool,
+        replayssm_buffer_len: int,
         num_spec: int = 0,
     ) -> tuple[tuple[int, ...], ...]:
         """GDN state shapes for the cached SPECULATIVE-decode kernel.
@@ -510,8 +510,8 @@ class MambaStateShapeCalculator:
             head_k_dim,
             head_v_dim,
             conv_kernel_size,
-            use_chunkdecode_spec,
-            chunkdecode_buffer_len,
+            use_replayssm_spec,
+            replayssm_buffer_len,
             num_spec,
         )
 

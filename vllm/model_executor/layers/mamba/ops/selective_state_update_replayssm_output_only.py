@@ -18,7 +18,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])}
 )
 @triton.jit
-def _chunkdecode_output_only_precompute_kernel(
+def _replayssm_output_only_precompute_kernel(
     B_ptr,
     C_ptr,
     B_cache_ptr,
@@ -129,7 +129,7 @@ def _chunkdecode_output_only_precompute_kernel(
     {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])}
 )
 @triton.jit
-def _chunkdecode_output_only_kernel(
+def _replayssm_output_only_kernel(
     # Pointers to matrices
     state_ptr,
     x_ptr,
@@ -404,7 +404,7 @@ def _chunkdecode_output_only_kernel(
     tl.store(out_ptr + offs_m * stride_out_dim, out, mask=offs_m < dim)
 
 
-def _get_chunkdecode_output_only_launch_config(dstate: int) -> tuple[int, int]:
+def _get_replayssm_output_only_launch_config(dstate: int) -> tuple[int, int]:
     if dstate <= 64:
         return 32, 4
     if dstate <= 128:
@@ -412,7 +412,7 @@ def _get_chunkdecode_output_only_launch_config(dstate: int) -> tuple[int, int]:
     return 16, 8
 
 
-def selective_state_update_chunkdecode_output_only(
+def selective_state_update_replayssm_output_only(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -505,7 +505,7 @@ def selective_state_update_chunkdecode_output_only(
 
     block_size_k_cache = max(1, triton.next_power_of_2(max_cache_len))
     block_size_k_dot = max(16, block_size_k_cache)
-    block_size_m, num_warps = _get_chunkdecode_output_only_launch_config(dstate)
+    block_size_m, num_warps = _get_replayssm_output_only_launch_config(dstate)
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
@@ -516,7 +516,7 @@ def selective_state_update_chunkdecode_output_only(
     )
 
     with torch.accelerator.device_index(x.device.index):
-        _chunkdecode_output_only_precompute_kernel[(batch, ngroups)](
+        _replayssm_output_only_precompute_kernel[(batch, ngroups)](
             B,
             C,
             B_cache,
@@ -547,7 +547,7 @@ def selective_state_update_chunkdecode_output_only(
             block_size_k_cache,
             num_warps=2,
         )
-        _chunkdecode_output_only_kernel[grid](
+        _replayssm_output_only_kernel[grid](
             state,
             x,
             dt,

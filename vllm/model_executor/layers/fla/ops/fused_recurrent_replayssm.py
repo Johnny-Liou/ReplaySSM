@@ -9,7 +9,7 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def fused_recurrent_gated_delta_rule_chunkdecode_kernel(
+def fused_recurrent_gated_delta_rule_replayssm_kernel(
     mixed_qkv, a, b, A_log, dt_bias, o, h0, ht,
     d_cache, k_cache, g_cache, ssm_state_indices, write_pos, scale,
     stride_mixed_qkv_tok: tl.constexpr,
@@ -146,7 +146,7 @@ def fused_recurrent_gated_delta_rule_chunkdecode_kernel(
             tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
 
 
-def fused_recurrent_gated_delta_rule_chunkdecode(
+def fused_recurrent_gated_delta_rule_replayssm(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
@@ -241,7 +241,7 @@ def fused_recurrent_gated_delta_rule_chunkdecode(
     BC = max(16, triton.next_power_of_2(max_cache_len))
 
     grid = (triton.cdiv(V, BV), B, HV)
-    fused_recurrent_gated_delta_rule_chunkdecode_kernel[grid](
+    fused_recurrent_gated_delta_rule_replayssm_kernel[grid](
         mixed_qkv=mixed_qkv, a=a, b=b, A_log=A_log, dt_bias=dt_bias, o=out,
         h0=initial_state, ht=initial_state,
         d_cache=d_cache, k_cache=k_cache, g_cache=g_cache,

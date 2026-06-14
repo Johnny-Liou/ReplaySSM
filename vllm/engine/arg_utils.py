@@ -675,10 +675,10 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
-    chunkdecode_buffer_len: int = CacheConfig.chunkdecode_buffer_len
-    use_chunkdecode: bool = CacheConfig.use_chunkdecode
-    chunkdecode_route: str = CacheConfig.chunkdecode_route
-    use_chunkdecode_spec: bool = CacheConfig.use_chunkdecode_spec
+    replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
+    use_replayssm: bool = CacheConfig.use_replayssm
+    replayssm_route: str = CacheConfig.replayssm_route
+    use_replayssm_spec: bool = CacheConfig.use_replayssm_spec
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     enable_mamba_cache_stochastic_rounding: bool = (
@@ -1161,18 +1161,18 @@ class EngineArgs:
             "--mamba-cache-mode", **cache_kwargs["mamba_cache_mode"]
         )
         cache_group.add_argument(
-            "--chunkdecode-buffer-len", **cache_kwargs["chunkdecode_buffer_len"]
+            "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
         )
         cache_group.add_argument(
-            "--use-chunkdecode", **cache_kwargs["use_chunkdecode"]
+            "--use-replayssm", **cache_kwargs["use_replayssm"]
         )
         cache_group.add_argument(
-            "--chunkdecode-route",
-            **cache_kwargs["chunkdecode_route"],
+            "--replayssm-route",
+            **cache_kwargs["replayssm_route"],
         )
         cache_group.add_argument(
-            "--use-chunkdecode-spec",
-            **cache_kwargs["use_chunkdecode_spec"],
+            "--use-replayssm-spec",
+            **cache_kwargs["use_replayssm_spec"],
         )
         cache_group.add_argument(
             "--kv-offloading-size", **cache_kwargs["kv_offloading_size"]
@@ -1786,10 +1786,10 @@ class EngineArgs:
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
             mamba_cache_mode=self.mamba_cache_mode,
-            chunkdecode_buffer_len=self.chunkdecode_buffer_len,
-            use_chunkdecode=self.use_chunkdecode,
-            chunkdecode_route=self.chunkdecode_route,
-            use_chunkdecode_spec=self.use_chunkdecode_spec,
+            replayssm_buffer_len=self.replayssm_buffer_len,
+            use_replayssm=self.use_replayssm,
+            replayssm_route=self.replayssm_route,
+            use_replayssm_spec=self.use_replayssm_spec,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )

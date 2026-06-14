@@ -56,7 +56,7 @@ class MambaBase(AttentionLayerBase):
             # checkpoint slots the baseline spec kernel writes. 
             num_speculative_blocks=(
                 0
-                if vllm_config.cache_config.use_chunkdecode_spec
+                if vllm_config.cache_config.use_replayssm_spec
                 else (
                     vllm_config.speculative_config.num_speculative_tokens
                     if vllm_config.speculative_config

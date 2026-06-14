@@ -78,7 +78,7 @@ def selective_state_update_ref(
     return out
 
 
-def selective_state_update_chunkdecode_state_and_output_ref(
+def selective_state_update_replayssm_state_and_output_ref(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -200,7 +200,7 @@ def selective_state_update_chunkdecode_state_and_output_ref(
     return out
 
 
-def selective_state_update_chunkdecode_output_only_ref(
+def selective_state_update_replayssm_output_only_ref(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,

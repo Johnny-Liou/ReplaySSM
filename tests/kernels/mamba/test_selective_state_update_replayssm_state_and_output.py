@@ -6,11 +6,11 @@ import torch
 
 from tests.kernels.mamba.utils import (
     allocate_update_caches,
-    selective_state_update_chunkdecode_state_and_output_ref,
+    selective_state_update_replayssm_state_and_output_ref,
 )
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import selective_state_update
-from vllm.model_executor.layers.mamba.ops.selective_state_update_chunkdecode_state_and_output import (
-    selective_state_update_chunkdecode_state_and_output,
+from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_state_and_output import (
+    selective_state_update_replayssm_state_and_output,
 )
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -48,7 +48,7 @@ def _tied_dt_bias(nheads: int, headdim: int, device: str) -> torch.Tensor:
 @pytest.mark.parametrize("ngroups", [1, 4])
 @pytest.mark.parametrize("dstate", [16, 64])
 @pytest.mark.parametrize("max_cache_len", [1, 4])
-def test_selective_state_update_chunkdecode_state_and_output_matches_baseline_decode(
+def test_selective_state_update_replayssm_state_and_output_matches_baseline_decode(
     max_cache_len: int,
     dstate: int,
     ngroups: int,
@@ -104,7 +104,7 @@ def test_selective_state_update_chunkdecode_state_and_output_matches_baseline_de
 
         out_cached = torch.empty_like(x)
         is_flush = write_pos == max_cache_len - 1
-        selective_state_update_chunkdecode_state_and_output(
+        selective_state_update_replayssm_state_and_output(
             state_cached,
             x,
             dt,
@@ -124,7 +124,7 @@ def test_selective_state_update_chunkdecode_state_and_output_matches_baseline_de
             out=out_cached,
         )
 
-        out_ref = selective_state_update_chunkdecode_state_and_output_ref(
+        out_ref = selective_state_update_replayssm_state_and_output_ref(
             state_ref,
             x,
             dt,
@@ -162,7 +162,7 @@ def test_selective_state_update_chunkdecode_state_and_output_matches_baseline_de
 
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("with_padding", [False, True])
-def test_selective_state_update_chunkdecode_state_and_output_with_batch_indices(
+def test_selective_state_update_replayssm_state_and_output_with_batch_indices(
     with_padding: bool,
     itype: torch.dtype,
 ):
@@ -233,7 +233,7 @@ def test_selective_state_update_chunkdecode_state_and_output_with_batch_indices(
 
         out_cached = torch.full_like(x, 42)
         is_flush = write_pos == max_cache_len - 1
-        selective_state_update_chunkdecode_state_and_output(
+        selective_state_update_replayssm_state_and_output(
             state_cached,
             x,
             dt,

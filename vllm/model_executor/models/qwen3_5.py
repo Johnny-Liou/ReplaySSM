@@ -679,18 +679,18 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, ...]:
-        if vllm_config.cache_config.use_chunkdecode_spec:
+        if vllm_config.cache_config.use_replayssm_spec:
             return MambaStateDtypeCalculator.gated_delta_net_spec_cached_state_dtype(
                 vllm_config.model_config.dtype,
                 vllm_config.cache_config.mamba_cache_dtype,
                 vllm_config.cache_config.mamba_ssm_cache_dtype,
-                vllm_config.cache_config.use_chunkdecode_spec,
+                vllm_config.cache_config.use_replayssm_spec,
             )
         return MambaStateDtypeCalculator.gated_delta_net_cached_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
-            vllm_config.cache_config.use_chunkdecode,
+            vllm_config.cache_config.use_replayssm,
         )
 
     @classmethod
@@ -705,7 +705,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             if vllm_config.speculative_config
             else 0
         )
-        if vllm_config.cache_config.use_chunkdecode_spec:
+        if vllm_config.cache_config.use_replayssm_spec:
             return MambaStateShapeCalculator.gated_delta_net_spec_cached_state_shape(
                 tp_size,
                 hf_config.linear_num_key_heads,
@@ -713,8 +713,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                 hf_config.linear_key_head_dim,
                 hf_config.linear_value_head_dim,
                 hf_config.linear_conv_kernel_dim,
-                vllm_config.cache_config.use_chunkdecode_spec,
-                vllm_config.cache_config.chunkdecode_buffer_len,
+                vllm_config.cache_config.use_replayssm_spec,
+                vllm_config.cache_config.replayssm_buffer_len,
                 num_spec,
             )
         return MambaStateShapeCalculator.gated_delta_net_cached_state_shape(
@@ -724,8 +724,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             hf_config.linear_key_head_dim,
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
-            vllm_config.cache_config.use_chunkdecode,
-            vllm_config.cache_config.chunkdecode_buffer_len,
+            vllm_config.cache_config.use_replayssm,
+            vllm_config.cache_config.replayssm_buffer_len,
             num_spec,
         )
 
