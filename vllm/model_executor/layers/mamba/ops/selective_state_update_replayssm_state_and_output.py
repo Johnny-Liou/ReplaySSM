@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E501
 
 import torch
 
@@ -74,17 +75,17 @@ def _replayssm_state_and_output_kernel(
     stride_out_head,
     stride_out_dim,
     # Cache strides
-    stride_xc_batch,
-    stride_xc_head,
-    stride_xc_dim,
-    stride_xc_pos,
-    stride_dtc_batch,
-    stride_dtc_head,
-    stride_dtc_pos,
-    stride_Bc_batch,
-    stride_Bc_group,
-    stride_Bc_pos,
-    stride_Bc_dstate,
+    stride_x_cache_batch,
+    stride_x_cache_head,
+    stride_x_cache_dim,
+    stride_x_cache_pos,
+    stride_dt_cache_batch,
+    stride_dt_cache_head,
+    stride_dt_cache_pos,
+    stride_B_cache_batch,
+    stride_B_cache_group,
+    stride_B_cache_pos,
+    stride_B_cache_dstate,
     stride_state_indices_batch,
     stride_state_indices_T,
     # Meta-parameters
@@ -103,12 +104,9 @@ def _replayssm_state_and_output_kernel(
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
 
+    # Resolve the physical state slot for this decode row; skip padded rows.
     if HAS_STATE_BATCH_INDICES:
-        state_batch_idx = tl.load(
-            state_batch_indices_ptr
-            + pid_b * stride_state_indices_batch
-            + 0 * stride_state_indices_T
-        ).to(tl.int64)
+        state_batch_idx = tl.load(state_batch_indices_ptr + pid_b * stride_state_indices_batch + 0 * stride_state_indices_T).to(tl.int64)
         if state_batch_idx == null_block_id:
             return
     else:
@@ -118,135 +116,92 @@ def _replayssm_state_and_output_kernel(
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
+    # Buffer cursor (number of cached tokens so far) and the flush flag.
     write_pos = tl.load(write_pos_ptr + pid_b).to(tl.int64)
     is_flush = tl.load(is_flush_ptr + pid_b) != 0
 
+    # Advance every pointer to this (row, head, group).
     state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
     x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
     dt_ptr += pid_b * stride_dt_batch + pid_h * stride_dt_head
     B_ptr += pid_b * stride_B_batch + (pid_h // nheads_ngroups_ratio) * stride_B_group
     C_ptr += pid_b * stride_C_batch + (pid_h // nheads_ngroups_ratio) * stride_C_group
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
+    x_cache_ptr += state_batch_idx * stride_x_cache_batch + pid_h * stride_x_cache_head
+    dt_cache_ptr += state_batch_idx * stride_dt_cache_batch + pid_h * stride_dt_cache_head
+    B_cache_ptr += state_batch_idx * stride_B_cache_batch + (pid_h // nheads_ngroups_ratio) * stride_B_cache_group
 
-    x_cache_ptr += state_batch_idx * stride_xc_batch + pid_h * stride_xc_head
-    dt_cache_ptr += state_batch_idx * stride_dtc_batch + pid_h * stride_dtc_head
-    B_cache_ptr += (
-        state_batch_idx * stride_Bc_batch
-        + (pid_h // nheads_ngroups_ratio) * stride_Bc_group
-    )
-
+    # Current-token dt (+ bias, softplus) and the per-head scalar A.
     dt_cur = tl.load(dt_ptr).to(tl.float32)
     if HAS_DT_BIAS:
         dt_cur += tl.load(dt_bias_ptr + pid_h * stride_dt_bias_head).to(tl.float32)
     if DT_SOFTPLUS:
         dt_cur = tl.where(dt_cur <= 20.0, softplus(dt_cur), dt_cur)
-
     A = tl.load(A_ptr + pid_h * stride_A_head).to(tl.float32)
 
-    dt_all = tl.load(
-        dt_cache_ptr + offs_k * stride_dtc_pos,
-        mask=offs_k < write_pos,
-        other=0.0,
-    ).to(tl.float32)
+    # dt over the window (cached history + current token at write_pos), then the
+    # decay weights: total decay exp(A*sum dt) and the per-position scale s_j.
+    dt_all = tl.load(dt_cache_ptr + offs_k * stride_dt_cache_pos, mask=offs_k < write_pos, other=0.0).to(tl.float32)
     dt_all = tl.where(offs_k == write_pos, dt_cur, dt_all)
-
     dA_cumsum = A * tl.cumsum(dt_all, axis=0)
     dA_total = A * tl.sum(dt_all, axis=0)
     total_decay = tl.exp(dA_total)
     scale = dt_all * tl.exp(dA_total - dA_cumsum)
     scale = tl.where(offs_k <= write_pos, scale, 0.0)
 
+    # Current-token x / C, the checkpoint state S_0, and current-token B.
     x_cur = tl.load(x_ptr + offs_m * stride_x_dim, mask=offs_m < dim, other=0.0)
-    C = tl.load(
-        C_ptr + offs_n * stride_C_dstate,
-        mask=offs_n < dstate,
-        other=0.0,
-    ).to(tl.float32)
-    state_ptrs = state_ptr + (
-        offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
-    )
-    state = tl.load(
-        state_ptrs,
-        mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
-        other=0.0,
-    )
+    C = tl.load(C_ptr + offs_n * stride_C_dstate, mask=offs_n < dstate, other=0.0).to(tl.float32)
+    state_ptrs = state_ptr + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+    state = tl.load(state_ptrs, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate), other=0.0)
     B_cur = tl.load(B_ptr + offs_n * stride_B_dstate, mask=offs_n < dstate, other=0.0)
 
-    x_all_ptrs = (
-        x_cache_ptr + offs_m[:, None] * stride_xc_dim
-        + offs_k[None, :] * stride_xc_pos
-    )
-    x_all = tl.load(
-        x_all_ptrs,
-        mask=(offs_m[:, None] < dim) & (offs_k[None, :] < write_pos),
-        other=0.0,
-    )
+    # Gather buffered x and B over the window (history + current token).
+    x_all_ptrs = x_cache_ptr + offs_m[:, None] * stride_x_cache_dim + offs_k[None, :] * stride_x_cache_pos
+    x_all = tl.load(x_all_ptrs, mask=(offs_m[:, None] < dim) & (offs_k[None, :] < write_pos), other=0.0)
     x_all = tl.where(offs_k[None, :] == write_pos, x_cur[:, None], x_all)
-
-    B_all_ptrs = (
-        B_cache_ptr + offs_k[:, None] * stride_Bc_pos
-        + offs_n[None, :] * stride_Bc_dstate
-    )
-    B_all = tl.load(
-        B_all_ptrs,
-        mask=(offs_k[:, None] < write_pos) & (offs_n[None, :] < dstate),
-        other=0.0,
-    )
+    B_all_ptrs = B_cache_ptr + offs_k[:, None] * stride_B_cache_pos + offs_n[None, :] * stride_B_cache_dstate
+    B_all = tl.load(B_all_ptrs, mask=(offs_k[:, None] < write_pos) & (offs_n[None, :] < dstate), other=0.0)
     B_all = tl.where(offs_k[:, None] == write_pos, B_cur[None, :], B_all)
 
+    # Reconstruct the state from cached inputs (outer-product / state route):
+    # S_t = total_decay * S_0 + sum_j s_j (v_j k_j^T). Store it back on a flush.
     B_scaled = (B_all.to(tl.float32) * scale[:, None]).to(x_ptr.dtype.element_ty)
     delta_state = tl.dot(x_all.to(x_ptr.dtype.element_ty), B_scaled)
     state_new = state.to(tl.float32) * total_decay + delta_state.to(tl.float32)
     if is_flush:
-        tl.store(
-            state_ptrs,
-            state_new.to(state.dtype),
-            mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
-        )
+        tl.store(state_ptrs, state_new.to(state.dtype), mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
+
+    # Read the output from the reconstructed state: y = S_t q.
     out = tl.sum(state_new * C[None, :], axis=1)
 
+    # Skip connection (D) and output gate (z).
     if HAS_D:
         D_ptr += pid_h * stride_D_head
-        D = tl.load(
-            D_ptr + offs_m * stride_D_dim,
-            mask=offs_m < dim,
-            other=0.0,
-        ).to(tl.float32)
+        D = tl.load(D_ptr + offs_m * stride_D_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
         out += x_cur.to(tl.float32) * D
-
     if HAS_Z:
         z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
-        z = tl.load(
-            z_ptr + offs_m * stride_z_dim,
-            mask=offs_m < dim,
-            other=0.0,
-        ).to(tl.float32)
+        z = tl.load(z_ptr + offs_m * stride_z_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
         out *= z * tl.sigmoid(z)
 
     tl.store(out_ptr + offs_m * stride_out_dim, out, mask=offs_m < dim)
 
+    # Non-flush step: append the current token (x, dt, B) into the buffer at write_pos.
     if not is_flush:
-        tl.store(
-            x_cache_ptr + offs_m * stride_xc_dim + write_pos * stride_xc_pos,
-            x_cur,
-            mask=offs_m < dim,
-        )
+        tl.store(x_cache_ptr + offs_m * stride_x_cache_dim + write_pos * stride_x_cache_pos, x_cur, mask=offs_m < dim)
         if pid_m == 0:
-            tl.store(dt_cache_ptr + write_pos * stride_dtc_pos, dt_cur)
-            tl.store(
-                B_cache_ptr + write_pos * stride_Bc_pos
-                + offs_n * stride_Bc_dstate,
-                B_cur,
-                mask=offs_n < dstate,
-            )
+            tl.store(dt_cache_ptr + write_pos * stride_dt_cache_pos, dt_cur)
+            tl.store(B_cache_ptr + write_pos * stride_B_cache_pos + offs_n * stride_B_cache_dstate, B_cur, mask=offs_n < dstate)
 
 
 def _get_replayssm_state_and_output_launch_config(dstate: int) -> tuple[int, int]:
+    """Config sweep is stronly recommend for different dstate and hardware"""
     if dstate <= 64:
-        return 32, 4
+        return 32, 1
     if dstate <= 128:
         return 32, 1
-    return 16, 8
+    return 32, 1
 
 
 def selective_state_update_replayssm_state_and_output(

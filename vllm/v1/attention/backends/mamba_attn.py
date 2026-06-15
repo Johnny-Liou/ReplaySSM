@@ -82,13 +82,13 @@ class BaseMambaAttentionMetadata:
     bc_pre_scratch: torch.Tensor | None = None
     # cached-SPEC (hybrid) cursors: persistent, block-keyed (full (num_blocks,)
     # buffers indexed by physical SSM block id), shared across all Mamba2 layers
-    # and advanced once per step by the commit. spec_cb_pre_scratch is the
+    # and advanced once per step by the commit. spec_bc_pre_scratch is the
     # per-step (decode_rows, ngroups, max_cache_len, block_spec) fp32 scratch.
     # All None unless the cached-spec kernel is enabled.
     spec_write_pos_d: torch.Tensor | None = None
     spec_post_origin_d: torch.Tensor | None = None
     spec_is_flush_d: torch.Tensor | None = None
-    spec_cb_pre_scratch: torch.Tensor | None = None
+    spec_bc_pre_scratch: torch.Tensor | None = None
 
 
 class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
@@ -225,7 +225,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         self.spec_write_pos: torch.Tensor | None = None
         self.spec_post_origin: torch.Tensor | None = None
         self.spec_is_flush: torch.Tensor | None = None
-        self.decode_spec_cb_pre: torch.Tensor | None = None
+        self.decode_spec_bc_pre: torch.Tensor | None = None
         if self.use_cache_spec_kernel:
             if len(kv_cache_spec.shapes) < 4:
                 raise ValueError(
@@ -242,13 +242,13 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             # It must therefore cover the max decode batch (max_num_seqs), NOT
             # decode_cudagraph_max_bs -- the latter is 0 under enforce_eager
             # (max_cudagraph_capture_size=0), which would make this scratch empty
-            # and the scatter write cb_pre[pid_b] out of bounds (IMA). Sizing by
+            # and the scatter write bc_pre[pid_b] out of bounds (IMA). Sizing by
             # max_num_seqs is CUDA-graph safe: the captured [:num_decodes] slice
             # shares the same (offset-0) base pointer and row strides.
             spec_scratch_bs = max(
                 self.decode_cudagraph_max_bs, scheduler_config.max_num_seqs
             )
-            self.decode_spec_cb_pre = torch.empty(
+            self.decode_spec_bc_pre = torch.empty(
                 (
                     spec_scratch_bs,
                     ngroups_local,
@@ -681,7 +681,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         spec_write_pos_d = None
         spec_post_origin_d = None
         spec_is_flush_d = None
-        spec_cb_pre_scratch = None
+        spec_bc_pre_scratch = None
         if (
             self.use_cache_spec_kernel
             and num_decodes > 0
@@ -754,8 +754,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             spec_write_pos_d = self.spec_write_pos
             spec_post_origin_d = self.spec_post_origin
             spec_is_flush_d = self.spec_is_flush
-            if self.decode_spec_cb_pre is not None:
-                spec_cb_pre_scratch = self.decode_spec_cb_pre[:num_decodes]
+            if self.decode_spec_bc_pre is not None:
+                spec_bc_pre_scratch = self.decode_spec_bc_pre[:num_decodes]
 
         metadata = self.metadata_cls(
             num_prefills=num_prefills,
@@ -772,7 +772,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             spec_write_pos_d=spec_write_pos_d,
             spec_post_origin_d=spec_post_origin_d,
             spec_is_flush_d=spec_is_flush_d,
-            spec_cb_pre_scratch=spec_cb_pre_scratch,
+            spec_bc_pre_scratch=spec_bc_pre_scratch,
             num_accepted_tokens=num_accepted_tokens,
             query_start_loc_d=query_start_loc_d,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
@@ -817,7 +817,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         spec_write_pos_d = metadata.spec_write_pos_d
         spec_post_origin_d = metadata.spec_post_origin_d
         spec_is_flush_d = metadata.spec_is_flush_d
-        spec_cb_pre_scratch = metadata.spec_cb_pre_scratch
+        spec_bc_pre_scratch = metadata.spec_bc_pre_scratch
         if (
             metadata.num_prefills == 0
             and metadata.num_decodes <= self.decode_cudagraph_max_bs
@@ -902,8 +902,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 ):
                     bc_pre_scratch = self.decode_bc_pre_scratch[:padded_bs]
 
-            if self.use_cache_spec_kernel and self.decode_spec_cb_pre is not None:
-                spec_cb_pre_scratch = self.decode_spec_cb_pre[:padded_bs]
+            if self.use_cache_spec_kernel and self.decode_spec_bc_pre is not None:
+                spec_bc_pre_scratch = self.decode_spec_bc_pre[:padded_bs]
 
         return replace(
             metadata,
@@ -916,7 +916,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             spec_write_pos_d=spec_write_pos_d,
             spec_post_origin_d=spec_post_origin_d,
             spec_is_flush_d=spec_is_flush_d,
-            spec_cb_pre_scratch=spec_cb_pre_scratch,
+            spec_bc_pre_scratch=spec_bc_pre_scratch,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
             block_idx_last_computed_token=block_idx_last_computed_token,
             block_idx_last_scheduled_token_prev_step=(

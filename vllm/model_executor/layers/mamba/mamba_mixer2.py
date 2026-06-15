@@ -1137,7 +1137,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     dt_bias=dt_bias,
                     dt_softplus=True,
                     out=preallocated_ssm_out_d,
-                    cb_pre=attn_metadata.spec_cb_pre_scratch,
+                    bc_pre=attn_metadata.spec_bc_pre_scratch,
                 )
             elif self.use_cache_kernel:
                 if is_mamba_cache_all:
