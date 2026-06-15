@@ -2242,10 +2242,17 @@ class VllmConfig:
             )
         max_cache_len = self.cache_config.replayssm_buffer_len
         max_spec_len = 1 + self.num_speculative_tokens
-        if max_cache_len < max_spec_len:
+        # Early-flush needs room on EVERY verify step for committed history plus a
+        # full draft window: write_pos can reach max_cache_len - max_spec_len at a
+        # flush step, so the buffer must hold 2 * max_spec_len. (The looser
+        # >= max_spec_len bound was the old truncation-approach minimum, which let
+        # configs with max_spec_len <= buffer_len < 2*max_spec_len silently
+        # truncate the verify window -> corrupted output.)
+        if max_cache_len < 2 * max_spec_len:
             raise ValueError(
                 "--use-replayssm-spec requires --replayssm-buffer-len "
-                f">= 1 + num_speculative_tokens ({max_spec_len}); got {max_cache_len}"
+                f">= 2 * (1 + num_speculative_tokens) ({2 * max_spec_len}); "
+                f"got {max_cache_len}"
             )
         if max_cache_len & (max_cache_len - 1) != 0:
             raise ValueError(

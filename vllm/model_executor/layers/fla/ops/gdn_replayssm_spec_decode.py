@@ -67,7 +67,7 @@ def gdn_replayssm_spec_circular_kernel(
     # --- per-request packed window ---
     bos = tl.load(query_start_loc + i_n * stride_qsl).to(tl.int64)
     eos = tl.load(query_start_loc + (i_n + 1) * stride_qsl).to(tl.int64)
-    spec_len = eos - bos  # full window length (pre-truncation)
+    spec_len = eos - bos  # full window length
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
 
@@ -96,9 +96,6 @@ def gdn_replayssm_spec_circular_kernel(
     b_write_pos = tl.load(write_pos + state_idx).to(tl.int64)
     b_cache_base = tl.load(cache_base + state_idx).to(tl.int32)
 
-    # TRUNCATION: cap the window so write_pos + spec_len_eff <= max_cache_len, so
-    # the circular buffer never self-collides (spec onto history).
-    spec_len = tl.minimum(spec_len, MAX_CACHE_LEN - b_write_pos)
     mask_s = o_s < spec_len
     out_mask = mask_s[:, None] & mask_v[None, :]
 
@@ -372,8 +369,7 @@ def _advance_gdn_spec_cursors_kernel(
         num_accepted_ptr + offs * stride_na, mask=valid, other=0
     ).to(tl.int32)
 
-    total_commit = tl.minimum(num_acc, MAX_CACHE_LEN - write_pos).to(tl.int32)
-    total_commit = tl.maximum(total_commit, 0).to(tl.int32)
+    total_commit = num_acc
     flush_now = (total_commit > 0) & (is_flush_cur != 0)
 
     new_base = tl.where(
@@ -382,16 +378,18 @@ def _advance_gdn_spec_cursors_kernel(
     new_wp = tl.where(is_flush_cur != 0, total_commit, write_pos + total_commit).to(
         tl.int32
     )
-    # EARLY-FLUSH (margin = 2 * max_spec_len): flush one window early so that on
-    # every verify step write_pos + spec_len <= max_cache_len holds, i.e. the
-    # spec window NEVER overflows the circular cache and the in-kernel truncation
-    # cap never binds. This is required for e2e correctness: the proposer
-    # (n-gram / MTP) cannot be told to cap its draft count, and the rejection
-    # sampler reads logits for EVERY window position -- so a truncated position
-    # would feed the sampler an uninitialized-`out` garbage logit (emitting a
-    # wrong token) and desync the committed state. Usable committed history is
-    # max_cache_len - 2*max_spec_len; raise replayssm_buffer_len for more.
-    next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) >= MAX_CACHE_LEN).to(tl.int8)
+    # EARLY-FLUSH (margin = 2 * max_spec_len, strict '>'): flush one window early
+    # so that on every verify step write_pos + spec_len <= max_cache_len holds,
+    # i.e. the spec window NEVER overflows the circular cache. This is required
+    # for e2e correctness: the proposer (n-gram / MTP) cannot be told to cap its
+    # draft count, and the rejection sampler reads logits for EVERY window
+    # position -- so an overflowing position would feed the sampler an
+    # uninitialized-`out` garbage logit (emitting a wrong token) and desync the
+    # committed state. The strict '>' uses the buffer exactly (max write_pos at a
+    # flush step = max_cache_len - max_spec_len, zero headroom); usable committed
+    # history is max_cache_len - 2*max_spec_len + 1; raise replayssm_buffer_len
+    # for more. Config enforces max_cache_len >= 2 * max_spec_len.
+    next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) > MAX_CACHE_LEN).to(tl.int8)
 
     tl.store(write_pos_ptr + blk, new_wp, mask=valid)
     tl.store(cache_base_ptr + blk, new_base, mask=valid)
@@ -643,8 +641,8 @@ def reset_gdn_replayssm_spec_cursors(
     """Reset the cursors of first-decode rows (prefill->decode handoff)."""
     n_rows = state_batch_indices.shape[0]
     BLOCK = triton.next_power_of_2(max(1, n_rows))
-    # Early-flush margin (2 * max_spec_len): mirror _advance_gdn_spec_cursors_kernel.
-    init_flush = 1 if 2 * max_spec_len >= max_cache_len else 0
+    # Early-flush margin (2 * max_spec_len, strict '>'): mirror _advance_gdn_spec_cursors_kernel.
+    init_flush = 1 if 2 * max_spec_len > max_cache_len else 0
     _reset_gdn_replayssm_spec_cursors_kernel[(1,)](
         write_pos,
         cache_base,

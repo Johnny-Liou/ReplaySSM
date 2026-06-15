@@ -76,10 +76,6 @@ def _fused_scatter_precompute_kernel(
     spec_len = (eos - bos).to(tl.int32)
     write_pos = tl.load(write_pos_ptr + state_batch_idx).to(tl.int32)
     post_origin = tl.load(post_origin_ptr + state_batch_idx).to(tl.int32)
-    # TRUNCATION: cap the window so write_pos + spec_len <= max_cache_len, so the
-    # circular buffer never self-collides. Drafts beyond the cap are dropped this
-    # step (not scattered, not output). max_cache_len == cache_buf_len here.
-    spec_len = tl.minimum(spec_len, max_cache_len - write_pos)
 
     offs_s = tl.arange(0, BLOCK_SIZE_SPEC)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
@@ -288,8 +284,6 @@ def _replayssm_spec_circular_kernel(
     is_flush = tl.load(is_flush_flags_ptr + state_batch_idx) != 0
     write_pos = tl.load(write_pos_ptr + state_batch_idx).to(tl.int32)
     post_origin = tl.load(post_origin_ptr + state_batch_idx).to(tl.int32)
-    # TRUNCATION (must match the scatter): cap the window to the cache buffer.
-    spec_len = tl.minimum(spec_len, max_cache_len - write_pos)
 
     # Axes: offs_m=headdim, offs_n=dstate, offs_k=cache window, offs_s=draft pos.
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -422,12 +416,6 @@ def _advance_write_pos_origin_kernel(
     ).to(tl.int32)
     num_accepted = tl.load(num_accepted_ptr + offs, mask=valid, other=0).to(tl.int32)
     total_commit = tl.where(valid, num_accepted, 0).to(tl.int32)
-    # TRUNCATION-consistent clamp: only tokens that actually fit the buffer were
-    # scattered into the cache, so at most (max_cache_len - write_pos) tokens can
-    # become committed history. Caps write_pos so the next window has room (the
-    # kernel truncates the verify window to the same bound). Upstream must reject
-    # the truncated drafts so committed == emitted (see flush reconstruction).
-    total_commit = tl.minimum(total_commit, (MAX_CACHE_LEN - write_pos)).to(tl.int32)
     flush_now = (total_commit > 0) & (is_flush_cur != 0)
     new_origin = tl.where(
         flush_now, (post_origin + write_pos) & (CACHE_BUF_LEN - 1), post_origin
@@ -437,9 +425,12 @@ def _advance_write_pos_origin_kernel(
         write_pos,
         tl.where(is_flush_cur != 0, total_commit, write_pos + total_commit),
     ).to(tl.int32)
-    # EARLY-FLUSH (margin = 2 * MAX_SPEC_LEN): flush one window early so that on
-    # EVERY verify step write_pos + spec_len <= max_cache_len
-    next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) >= MAX_CACHE_LEN).to(tl.int8)
+    # EARLY-FLUSH (margin = 2 * MAX_SPEC_LEN, strict '>'): flush one window early
+    # so that on EVERY verify step write_pos + spec_len <= max_cache_len. The
+    # strict '>' uses the buffer exactly -- the largest write_pos at a flush step
+    # is max_cache_len - max_spec_len, whose window fills the last slots with zero
+    # headroom. Config enforces max_cache_len >= 2 * max_spec_len.
+    next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) > MAX_CACHE_LEN).to(tl.int8)
     tl.store(post_origin_ptr + state_batch_idx, new_origin, mask=valid)
     tl.store(write_pos_ptr + state_batch_idx, new_wp, mask=valid)
     tl.store(is_flush_ptr + state_batch_idx, next_is_flush, mask=valid)
@@ -483,8 +474,7 @@ def _reset_replayssm_spec_cursors_kernel(
 
 
 def _get_spec_launch_config(dstate: int, max_spec_len: int) -> tuple[int, int]:
-    """Config sweep is stronly recommend for different dstate, spec_len and hardware"""
-    block_spec = max(1, triton.next_power_of_2(max_spec_len))
+    """Config sweep is strongly recommended for different dstate, spec_len and hardware"""
     block_size_m = 16
     if dstate <= 64:
         num_warps = 2 if max_spec_len in (1, 8) else 1
@@ -759,9 +749,10 @@ def reset_replayssm_spec_cursors(
     Hybrid: cursors only -- no pre_conv_cache seed (conv_state carries context)."""
     batch = state_batch_indices.shape[0]
     BLOCK = max(1, triton.next_power_of_2(batch))
-    # Early-flush margin (2 * max_spec_len): match _advance_write_pos_origin_kernel
-    # so the first decode after prefill agrees with the steady-state flush cadence.
-    init_is_flush = 1 if 2 * max_spec_len >= max_cache_len else 0
+    # Early-flush margin (2 * max_spec_len, strict '>'): match
+    # _advance_write_pos_origin_kernel so the first decode after prefill agrees
+    # with the steady-state flush cadence.
+    init_is_flush = 1 if 2 * max_spec_len > max_cache_len else 0
     with torch.cuda.device(write_pos.device.index):
         _reset_replayssm_spec_cursors_kernel[(1,)](
             write_pos,
