@@ -253,6 +253,7 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 # Profiling scripts and results
 profiling*/
 output_*/
+benchmarks/replayssm/*.sh
 
 # Slurm job files
 *.err

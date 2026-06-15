@@ -197,10 +197,7 @@ class MambaStateDtypeCalculator:
         """GDN state dtypes for the cached SPECULATIVE-decode kernel.
 
         Same ``d/k/g`` ring page as the non-spec cached path, but the ``ssm``
-        checkpoint is forced to ``float32``: the circular spec kernel
-        reconstructs the committed-history state over a full window, which is
-        precision-sensitive (the FlashMamba reference validated an fp32
-        checkpoint). Returns the baseline ``(conv, ssm)`` when the flag is off.
+        checkpoint is forced to ``float32`` Returns the baseline ``(conv, ssm)`` when the flag is off.
         """
         conv_dtype, ssm_dtype = cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype

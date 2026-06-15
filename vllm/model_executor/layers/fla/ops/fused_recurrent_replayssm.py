@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -33,18 +34,20 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     o_c = tl.arange(0, BC)
     mask_v = o_v < V
 
+    # Resolve the physical state slot; zero the output and bail for padded rows.
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + o_v
     if state_idx <= 0:
         tl.store(p_o, tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty), mask=mask_v)
         return
 
+    # Per-row buffer cursor and flush flag; valid (committed) cache positions.
     # vLLM: write_pos is per decode row (i_n), not per physical slot.
     b_write_pos = tl.load(write_pos + i_n).to(tl.int64)
     b_is_flush = b_write_pos == MAX_CACHE_LEN - 1
     cache_valid = o_c < b_write_pos
 
-    # --- gate (per-head scalars) ---
+    # Gate for the current token: decay g, its exp alpha, and the beta mixing weight.
     a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
     b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
@@ -55,7 +58,7 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     alpha_val = tl.exp(g_val)
     beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
 
-    # --- replay decay from cached g (over BC) ---
+    # Replay decay over the committed cache, from the cached per-step gates g.
     p_g_main = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c
     b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
     b_g_prefix = tl.cumsum(b_g_all, axis=0)
@@ -63,18 +66,16 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     b_replay_decay = tl.where(cache_valid, tl.exp(b_g_total - b_g_prefix), 0.0)
     b_total_decay = tl.exp(b_g_total)
 
-    # --- cached update vectors d (K-independent), scaled by replay decay ---
-    p_d_main = d_cache + (
-        ((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None]
-    )
+    # Cached delta-rule update vectors d (K-independent), scaled by the replay decay.
+    p_d_main = d_cache + (((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None])
     b_d_all = tl.load(p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0).to(tl.float32)
     b_d_scaled_tc = (b_d_all * b_replay_decay[None, :]).to(p_o.dtype.element_ty)  # [BV, BC]
 
-    # --- current value (for the delta-rule update) ---
+    # Current token value (for the delta-rule update).
     v_off = (2 * H * K) + i_hv * V + o_v
     b_v = tl.load(mixed_qkv + i_n * stride_mixed_qkv_tok + v_off, mask=mask_v, other=0).to(tl.float32)
 
-    # --- optional q/k L2 norm: need full-vector norms (computed, not kept) ---
+    # Optional q/k L2 norm: full-vector reciprocal norms (computed, not kept).
     if USE_QK_L2NORM_IN_KERNEL:
         o_kf = tl.arange(0, BK)
         mask_kf = o_kf < K
@@ -87,7 +88,9 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
         q_rnorm = 1.0
         k_rnorm = 1.0
 
-    # --- K-tiled accumulation of the two projections (no full [BV,BK] tile) ---
+    # Reconstruct the state from the checkpoint + cached (d, k) in K tiles and read
+    # it with the current q and k. K-tiling avoids holding a full [BV, BK] tile.
+    # Also append the current key chunk to the ring cache (non-flush only).
     b_state_q = tl.zeros([BV], dtype=tl.float32)
     b_state_k = tl.zeros([BV], dtype=tl.float32)
     cur_kq = tl.zeros([1], dtype=tl.float32)
@@ -101,21 +104,23 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
         q_cs = q_c * scale
         cur_kq += tl.sum(k_c * q_cs)
 
+        # Reconstruct this K tile of the state: S = total_decay * S_0 + d_scaled . k_cache.
         p_h0_c = h0 + state_idx * stride_init_state_token + i_hv * V * K + o_v[:, None] * K + o_kt[None, :]
         b_h0_c = tl.load(p_h0_c, mask=mask_v[:, None] & mask_kt[None, :], other=0).to(tl.float32)
         p_k_c = k_cache + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K + o_kt[None, :]
         b_k_all_c = tl.load(p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0).to(p_o.dtype.element_ty)
-
         b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_scaled_tc, b_k_all_c).to(tl.float32)  # [BV, BKT]
+
+        # Read the state with q and k (accumulated across K tiles).
         b_state_q += tl.sum(b_h_c * q_cs[None, :], axis=1)
         b_state_k += tl.sum(b_h_c * k_c[None, :], axis=1)
 
-        # Append current key chunk to the cache (non-flush only).
         if write_k:
             p_cur_k = k_cache + ((state_idx * H + i_h) * MAX_CACHE_LEN + b_write_pos) * K + o_kt
             tl.store(p_cur_k, k_c.to(p_o.dtype.element_ty), mask=mask_kt & (b_write_pos < MAX_CACHE_LEN))
 
-    # --- current token output ---
+    # Current-token output: alpha*(S q) + d_cur * (k . q), with the new update
+    # vector d_cur = beta * (v - alpha*(S k)).
     b_state_q *= alpha_val
     b_state_k *= alpha_val
     b_d_cur = beta_val * (b_v - b_state_k)
@@ -123,7 +128,8 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
     if b_is_flush:
-        # Re-walk K chunks to store the new checkpoint S_t = alpha*S_n + d_t k_t^T.
+        # Flush: fold the current token into the checkpoint, S_t = alpha*S + d_t k_t^T,
+        # and persist it. Re-walk K chunks to rebuild S before applying the update.
         for kk in range(NK):
             o_kt = kk * BKT + tl.arange(0, BKT)
             mask_kt = o_kt < K
@@ -138,7 +144,8 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
             p_ht_c = ht + state_idx * stride_final_state_token + i_hv * V * K + o_v[:, None] * K + o_kt[None, :]
             tl.store(p_ht_c, b_h_new_c.to(p_ht_c.dtype.element_ty), mask=mask_v[:, None] & mask_kt[None, :])
     else:
-        # K-independent cache writes (d, g). The k chunks were written in the loop.
+        # Non-flush: append the current token's update vector d and gate g to the
+        # cache (the k chunks were already written inside the loop above).
         p_cur_d = d_cache + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * V + o_v
         tl.store(p_cur_d, b_d_cur.to(p_cur_d.dtype.element_ty), mask=mask_v & (b_write_pos < MAX_CACHE_LEN))
         if i_v == 0:
