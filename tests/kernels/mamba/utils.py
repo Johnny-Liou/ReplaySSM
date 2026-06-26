@@ -179,8 +179,11 @@ def selective_state_update_replayssm_state_and_output_ref(
         B_all[:, cache_len, :] = B[b]
 
         B_heads = B_all.repeat_interleave(ratio, dim=0)
-        x_scaled = x_all.float() * scale[:, None, :]
-        delta = torch.einsum("hdk,hkn->hdn", x_scaled, B_heads.float())
+        # Mirror the kernel: it scales B and rounds B*scale to the buffer dtype
+        # before the tl.dot reconstruction (the matmul runs on buffer-dtype
+        # operands). For bf16 buffers this rounds; for fp32 it is a no-op.
+        B_scaled = (B_heads.float() * scale[:, :, None]).to(B_heads.dtype)
+        delta = torch.einsum("hdk,hkn->hdn", x_all.float(), B_scaled.float())
         state_new = state[b].float() * total_decay[:, None, None] + delta
         if is_flush:
             state[b].copy_(state_new.to(state.dtype))
@@ -294,8 +297,9 @@ def selective_state_update_replayssm_output_only_ref(
         C_heads_b = C_heads[b]
 
         if is_flush:
-            x_scaled = x_all.float() * scale[:, None, :]
-            delta = torch.einsum("hdk,hkn->hdn", x_scaled, B_heads.float())
+            # Mirror the kernel's bf16 reconstruction (see the cached-dot ref).
+            B_scaled = (B_heads.float() * scale[:, :, None]).to(B_heads.dtype)
+            delta = torch.einsum("hdk,hkn->hdn", x_all.float(), B_scaled.float())
             state_new = state[b].float() * total_decay[:, None, None] + delta
             state[b].copy_(state_new.to(state.dtype))
             out[b] = torch.einsum("hdn,hn->hd", state_new, C_heads_b.float())

@@ -167,7 +167,11 @@ def _replayssm_state_and_output_kernel(
     # Reconstruct the state from cached inputs (outer-product / state route):
     # S_t = total_decay * S_0 + sum_j s_j (v_j k_j^T). Store it back on a flush.
     B_scaled = (B_all.to(tl.float32) * scale[:, None]).to(x_ptr.dtype.element_ty)
-    delta_state = tl.dot(x_all.to(x_ptr.dtype.element_ty), B_scaled)
+    # tf32x3 keeps fp32 parity with the elementwise baseline (plain tf32 on
+    # fp32 inputs drifts ~1e-2); bf16/fp16 inputs are unaffected by this flag.
+    delta_state = tl.dot(
+        x_all.to(x_ptr.dtype.element_ty), B_scaled, input_precision="tf32x3"
+    )
     state_new = state.to(tl.float32) * total_decay + delta_state.to(tl.float32)
     if is_flush:
         tl.store(state_ptrs, state_new.to(state.dtype), mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))

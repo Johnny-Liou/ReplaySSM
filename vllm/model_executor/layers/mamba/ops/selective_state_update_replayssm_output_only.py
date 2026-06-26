@@ -312,7 +312,11 @@ def _replayssm_output_only_kernel(
 
         # Reconstruct the state from cached inputs and store it as the checkpoint.
         B_scaled = (B_all_dot.to(tl.float32) * scale_dot[:, None]).to(x_ptr.dtype.element_ty)
-        delta_state = tl.dot(x_all_dot.to(x_ptr.dtype.element_ty), B_scaled)
+        # tf32x3 keeps fp32 parity with the elementwise baseline (plain tf32 on
+        # fp32 inputs drifts ~1e-2); bf16/fp16 inputs are unaffected by this flag.
+        delta_state = tl.dot(
+            x_all_dot.to(x_ptr.dtype.element_ty), B_scaled, input_precision="tf32x3"
+        )
         state_new = state.to(tl.float32) * total_decay_dot + delta_state.to(tl.float32)
         tl.store(state_ptrs, state_new.to(state.dtype), mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
         out = tl.sum(state_new * C[None, :], axis=1)
