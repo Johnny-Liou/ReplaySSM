@@ -341,14 +341,16 @@ def _replayssm_spec_circular_kernel(
     state_f = state.to(tl.float32)
     x_cache_block = tl.load(x_cache_ptr + phys_k[None, :] * stride_x_cache_pos + offs_m[:, None] * stride_x_cache_dim, mask=(offs_m[:, None] < dim) & cache_valid_mask[None, :], other=0.0)
     x_cache_ty = x_cache_block.to(x_cache_ptr.dtype.element_ty)
-    state_ty = state_f.to(x_cache_ptr.dtype.element_ty)
     bc = tl.load(bc_pre_ptr + offs_k[:, None] * stride_bc_pre_pos + offs_s[None, :] * stride_bc_pre_spec, mask=cache_valid_mask[:, None] & spec_valid_mask[None, :], other=0.0).to(tl.float32)
     C_load_mask = spec_valid_mask[:, None] & (offs_n[None, :] < dstate) & (spec_cache_pos[:, None] < max_cache_len)
     C_spec = tl.load(C_full_ptr + phys_spec[:, None] * stride_C_full_pos + offs_n[None, :] * stride_C_full_dstate, mask=C_load_mask, other=0.0).to(tl.float32)
-    C_spec_ty = C_spec.to(x_cache_ptr.dtype.element_ty)
 
     # Per-draft output-only readout: decayed checkpoint term (S_0 q_s) ...
-    checkpoint_out = tl.dot(state_ty, tl.trans(C_spec_ty), input_precision="tf32x3").to(tl.float32)
+    # tf32x3 for fp32 activations (~fp32 parity), single-pass tf32 for bf16.
+    if x_cache_ptr.dtype.element_ty == tl.float32:
+        checkpoint_out = tl.dot(state_f, tl.trans(C_spec), input_precision="tf32x3").to(tl.float32)
+    else:
+        checkpoint_out = tl.dot(state_f, tl.trans(C_spec), input_precision="tf32").to(tl.float32)
     checkpoint_out *= checkpoint_decay[None, :]
     # ... plus the causal weighted sum over cached values via the k^T q GEMM.
     spec_scale_mat = dt_cache_block[:, None] * tl.exp(tl.minimum(A_val * (spec_total[None, :] - dt_cum[:, None]), 0.0))
