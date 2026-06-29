@@ -21,7 +21,8 @@ Examples (B300):
     python e2e_spec_decode_throughput.py --batch-size 512 \
         --model-id nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
     python e2e_spec_decode_throughput.py --batch-size 512 \
-        --model-id nvidia/Qwen3.5-122B-A10B-NVFP4 --spec-method qwen3_next_mtp
+        --model-id nvidia/Qwen3.5-122B-A10B-NVFP4 --spec-method qwen3_next_mtp \
+        --moe-backend triton
 """
 
 import argparse
@@ -64,6 +65,10 @@ def parse_args():
                         "--no-disable-flashinfer-autotune for non-FP4 models.")
     p.add_argument("--modes", default="ar,standard,cache",
                    help="Comma-separated subset of {ar,standard,cache}.")
+    p.add_argument("--moe-backend", default=None,
+                   help="Override the draft-model MoE backend (e.g. triton). On "
+                        "Blackwell the draft's bf16 MoE hangs on flashinfer_trtllm; "
+                        "pass triton. Main-model MoE is left at auto.")
     p.add_argument("--worker", choices=["ar", "standard", "cache"], default=None,
                    help=argparse.SUPPRESS)
     return p.parse_args()
@@ -106,6 +111,9 @@ def run_worker(args):
         disable_log_stats=False,
         gpu_memory_utilization=args.gpu_memory_utilization,
         seed=0,
+        # Avoid the FlashInfer GDN-prefill cutlass-DSL JIT stall on Blackwell
+        # (same default as the decode benchmark).
+        additional_config={"gdn_prefill_backend": "triton"},
         # Capture a CUDA graph for the full spec-decode batch (bs * spec_window
         # tokens per step); otherwise large batches fall back to eager.
         compilation_config={
@@ -117,10 +125,14 @@ def run_worker(args):
         # re-enable (--no-disable-flashinfer-autotune) only for non-FP4 models.
         llm_kwargs["kernel_config"] = {"enable_flashinfer_autotune": False}
     if mode != "ar":
-        llm_kwargs["speculative_config"] = {
+        spec_cfg = {
             "method": args.spec_method,
             "num_speculative_tokens": args.num_spec,
         }
+        # Override only the draft MoE backend (the trtllm hang is in the draft).
+        if args.moe_backend:
+            spec_cfg["moe_backend"] = args.moe_backend
+        llm_kwargs["speculative_config"] = spec_cfg
     if mode == "cache":
         llm_kwargs["use_replayssm_spec"] = True
         llm_kwargs["replayssm_buffer_len"] = args.buffer_len
@@ -181,6 +193,8 @@ def run_one_mode(args, mode):
     ]
     if args.enable_thinking:
         cmd.append("--enable-thinking")
+    if args.moe_backend:
+        cmd += ["--moe-backend", args.moe_backend]
     cmd.append("--disable-flashinfer-autotune" if args.disable_flashinfer_autotune
                else "--no-disable-flashinfer-autotune")
 
