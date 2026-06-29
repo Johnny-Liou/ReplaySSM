@@ -215,10 +215,19 @@ def _run_standard_decode(
             is_flush, torch.zeros_like(write_pos), write_pos + 1)
 
 
+# State/activation precisions. fp32 state is the default; bf16/fp16 are the
+# reduced-footprint configs. fp16 appears both as an activation dtype (fully-fp16
+# model sfp16_afp16, or fp16 act over fp32 state s32_afp16) and as a state dtype
+# under bf16 activations (sfp16_a16): fp16 has a finer mantissa than bf16 at the
+# same 2 bytes, so it is a more accurate state at no extra footprint. We still
+# skip fp16 state under fp32 activations (the unused low-state/high-act mix).
 _PRECISIONS = [
     pytest.param((torch.float32, torch.float32), id="s32_a32"),
     pytest.param((torch.float32, torch.bfloat16), id="s32_a16"),
     pytest.param((torch.bfloat16, torch.bfloat16), id="s16_a16"),
+    pytest.param((torch.float32, torch.float16), id="s32_afp16"),
+    pytest.param((torch.float16, torch.float16), id="sfp16_afp16"),
+    pytest.param((torch.float16, torch.bfloat16), id="sfp16_a16"),
 ]
 # Small synthetic shapes for the full axis sweep (compile fast).
 _SMALL_GEOMETRIES = [
@@ -303,6 +312,7 @@ def test_replayssm_standard_decode_real_geometry(
     [
         pytest.param((torch.float32, torch.float32), id="s32_a32"),
         pytest.param((torch.float32, torch.bfloat16), id="s32_a16"),
+        pytest.param((torch.float32, torch.float16), id="s32_afp16"),
     ],
 )
 def test_replayssm_standard_decode_desync_write_pos(

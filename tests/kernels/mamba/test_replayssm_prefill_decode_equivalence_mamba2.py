@@ -172,10 +172,16 @@ def _run_prefill_decode_equivalence(
 @pytest.mark.parametrize("route", ["output_only", "state_and_output"])
 @pytest.mark.parametrize(
     "precision",
+    # fp32 state is the default; bf16/fp16 are reduced-footprint configs. fp16
+    # appears as an activation dtype (s32_afp16, sfp16_afp16) and as a finer-
+    # mantissa state under bf16 activations (sfp16_a16).
     [
         pytest.param((torch.float32, torch.float32), id="s32_a32"),
         pytest.param((torch.float32, torch.bfloat16), id="s32_a16"),
         pytest.param((torch.bfloat16, torch.bfloat16), id="s16_a16"),
+        pytest.param((torch.float32, torch.float16), id="s32_afp16"),
+        pytest.param((torch.float16, torch.float16), id="sfp16_afp16"),
+        pytest.param((torch.float16, torch.bfloat16), id="sfp16_a16"),
     ],
 )
 @pytest.mark.parametrize(

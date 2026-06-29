@@ -167,11 +167,14 @@ def _run_gdn_teacher_equivalence(
         rtol=o_rtol, atol=o_atol)
 
 
-# The chunked prefill teacher is bf16-only, so the activation dtype is bf16;
-# state precision is still swept (fp32 state is the production config).
+# The chunked prefill teacher is bf16-activation-only, so the activation dtype is
+# bf16; the recurrent-state precision is still swept: fp32 (production), bf16, and
+# fp16 (a finer-mantissa state than bf16 at the same 2 bytes). Fully-fp16
+# activations are out of scope here (the teacher cannot run them).
 _PRECISIONS = [
     pytest.param((torch.float32, torch.bfloat16), id="s32_a16"),
     pytest.param((torch.bfloat16, torch.bfloat16), id="s16_a16"),
+    pytest.param((torch.float16, torch.bfloat16), id="sfp16_a16"),
 ]
 _GEOMETRIES = [
     # (num_q_heads, num_v_heads, head_k_dim, head_v_dim)
