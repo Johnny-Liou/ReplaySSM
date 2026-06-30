@@ -64,6 +64,10 @@ def parse_args():
                         "It is unstable under CUDA-graph capture on the "
                         "pre-release Blackwell FP4 path; pass "
                         "--no-disable-flashinfer-autotune for non-FP4 models.")
+    p.add_argument("--replayssm-route", default="output_only",
+                   choices=["output_only", "state_and_output"],
+                   help="Mamba2 cached route: output_only (cached_bc) or "
+                        "state_and_output (cached_dot). GDN models ignore it.")
     p.add_argument("--worker", choices=["standard", "replayssm"], default=None,
                    help=argparse.SUPPRESS)
     return p.parse_args()
@@ -108,7 +112,7 @@ def run_worker(args):
         llm_kwargs["kernel_config"] = {"enable_flashinfer_autotune": False}
     if mode == "replayssm":
         llm_kwargs.update(use_replayssm=True, replayssm_buffer_len=args.buffer_len,
-                          replayssm_route="output_only")  # ignored by GDN models
+                          replayssm_route=args.replayssm_route)  # route ignored by GDN models
 
     llm = LLM(**llm_kwargs)
     prompts = [args.prompt] * args.batch_size
@@ -154,6 +158,7 @@ def run_one_mode(args, mode) -> dict:
         "--buffer-len", str(args.buffer_len), "--dtype", args.dtype,
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--gdn-prefill-backend", args.gdn_prefill_backend,
+        "--replayssm-route", args.replayssm_route,
     ]
     cmd.append("--disable-flashinfer-autotune" if args.disable_flashinfer_autotune
                else "--no-disable-flashinfer-autotune")

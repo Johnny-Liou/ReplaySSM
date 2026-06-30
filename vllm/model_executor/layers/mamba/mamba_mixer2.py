@@ -1127,7 +1127,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     is_flush=attn_metadata.spec_is_flush_d,
                     query_start_loc=query_start_loc_d,
                     state_batch_indices=state_indices_tensor_d[:, 0],
-                    max_cache_len=self.max_cache_len,
+                    max_cache_len=self.max_cache_len + self.max_spec_len,
                     max_spec_len=self.max_spec_len,
                     d_inner=self.intermediate_size // self.tp_size,
                     ngroups=self.n_groups // self.tp_size,

@@ -2240,24 +2240,16 @@ class VllmConfig:
                 "--use-replayssm-spec does not support Mamba cache "
                 "stochastic rounding"
             )
-        max_cache_len = self.cache_config.replayssm_buffer_len
         max_spec_len = 1 + self.num_speculative_tokens
-        # Early-flush needs room on EVERY verify step for committed history plus a
-        # full draft window: write_pos can reach max_cache_len - max_spec_len at a
-        # flush step, so the buffer must hold 2 * max_spec_len. (The looser
-        # >= max_spec_len bound was the old truncation-approach minimum, which let
-        # configs with max_spec_len <= buffer_len < 2*max_spec_len silently
-        # truncate the verify window -> corrupted output.)
-        if max_cache_len < 2 * max_spec_len:
+        # replayssm_buffer_len is the history block B; the flush threshold is
+        # L = B + max_spec_len and the usable committed history is B - max_spec_len,
+        # so B must be at least max_spec_len. The physical ring buffer is the
+        # power-of-two next_pow2(L), so B itself need not be a power of two.
+        if self.cache_config.replayssm_buffer_len < max_spec_len:
             raise ValueError(
                 "--use-replayssm-spec requires --replayssm-buffer-len "
-                f">= 2 * (1 + num_speculative_tokens) ({2 * max_spec_len}); "
-                f"got {max_cache_len}"
-            )
-        if max_cache_len & (max_cache_len - 1) != 0:
-            raise ValueError(
-                "--use-replayssm-spec requires --replayssm-buffer-len to "
-                f"be a power of two (circular-cache bitmask index); got {max_cache_len}"
+                f">= 1 + num_speculative_tokens ({max_spec_len}); "
+                f"got {self.cache_config.replayssm_buffer_len}"
             )
         return self
 

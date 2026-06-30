@@ -142,9 +142,10 @@ class CacheConfig:
            when the token is at position i * block_size.
     """
     replayssm_buffer_len: int = Field(default=16, gt=0)
-    """ReplaySSM input-buffer capacity: the maximum number of autoregressive
-    Mamba2 decode steps to accumulate in the ring buffer before flushing the
-    checkpoint state."""
+    """ReplaySSM history block B. Autoregressive decode (use_replayssm) flushes
+    the checkpoint every B steps. Speculative decode (use_replayssm_spec) keeps a
+    L = B + 1 + num_speculative_tokens history window (usable committed history
+    B - 1 - num_speculative_tokens) in a power-of-two next_pow2(L) ring buffer."""
     use_replayssm: bool = False
     """Use the ReplaySSM Mamba2 decode kernel (cache recent SSM inputs instead
     of writing the recurrent state back to HBM each step). Only supported for
@@ -157,11 +158,10 @@ class CacheConfig:
     - "state_and_output": outer-product route. Reconstructs the full SSM state
        every step via tl.dot, then reads the output from it."""
     use_replayssm_spec: bool = False
-    """Use the ReplaySSM speculative-decode Mamba2 kernel (circular post-conv
-    cache + early-flush). Requires speculative decoding and
-    mamba_cache_mode='none'; reuses vLLM's causal_conv1d_update for the conv
-    (hybrid). Mutually exclusive with use_replayssm. replayssm_buffer_len must be
-    a power of two and >= 2 * (1 + num_speculative_tokens)."""
+    """Use the ReplaySSM speculative-decode kernel (circular cache + early-flush)
+    for Mamba2 and GDN. Requires speculative decoding and mamba_cache_mode='none';
+    reuses vLLM's causal_conv1d_update for the conv (hybrid). Mutually exclusive
+    with use_replayssm. replayssm_buffer_len must be >= 1 + num_speculative_tokens."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)

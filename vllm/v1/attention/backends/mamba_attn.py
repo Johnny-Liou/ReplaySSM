@@ -119,6 +119,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             vllm_config.cache_config.use_replayssm_spec
         )
         self.max_spec_len = 1 + self.num_spec_tokens
+        # L = B + max_spec_len history window; physical pow2 ring = next_pow2(L).
+        self.spec_flush_threshold = self.max_cache_len + self.max_spec_len
+        self.spec_cache_buf_len = 1 << (self.spec_flush_threshold - 1).bit_length()
 
         assert isinstance(kv_cache_spec, MambaSpec)
         scheduler_config = vllm_config.scheduler_config
@@ -252,7 +255,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 (
                     spec_scratch_bs,
                     ngroups_local,
-                    self.max_cache_len,
+                    self.spec_cache_buf_len,
                     block_spec,
                 ),
                 dtype=torch.float32,
@@ -716,9 +719,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 self.spec_is_flush,
                 num_accepted_tokens.to(torch.int32),
                 sbi,
-                max_cache_len=self.max_cache_len,
+                max_cache_len=self.spec_flush_threshold,
                 max_spec_len=self.max_spec_len,
-                cache_buf_len=self.max_cache_len,
+                cache_buf_len=self.spec_cache_buf_len,
             )
             # prefill->decode reset for first-decode rows (cursors only; no conv
             # seed -- conv_state carries context). A request's first spec verify
@@ -731,8 +734,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             # the spec verify path -> the old guard silently skipped the reset,
             # leaving recycled blocks with stale cursors and fresh blocks with a
             # wrong first-decode write_pos (coherent-but-divergent output +
-            # acceptance drop). Mirrors the GDN fix; see
-            # CACHED_SPEC_GDN_INTEGRATION.md §10.2.
+            # acceptance drop).
             num_prompt_tokens_cpu = common_attn_metadata.num_prompt_tokens_cpu
             if num_prompt_tokens_cpu is not None:
                 ctx_lens = common_attn_metadata.compute_num_computed_tokens()
@@ -748,7 +750,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     self.spec_is_flush,
                     first_decode_d,
                     sbi,
-                    max_cache_len=self.max_cache_len,
+                    max_cache_len=self.spec_flush_threshold,
                     max_spec_len=self.max_spec_len,
                 )
             spec_write_pos_d = self.spec_write_pos

@@ -572,16 +572,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
-        # Cached-decode kernel (reuses the engine-level mamba_* flags; see
-        # implementation_markdown/CACHED_GDN_INTEGRATION.md). When enabled, the
-        # paged GDN page grows to 5 tensors and the non-spec decode branch
-        # decodes through fused_recurrent_gated_delta_rule_replayssm.
+        # Cached-decode kernel (reuses the engine-level mamba_* flags). When
+        # enabled, the paged GDN page grows to 5 tensors and the non-spec decode
+        # branch decodes through fused_recurrent_gated_delta_rule_replayssm.
         self.use_cache_kernel = self.cache_config.use_replayssm
         self.max_cache_len = self.cache_config.replayssm_buffer_len
-        # Cached-SPEC decode kernel (gdn_replayssm_spec_decode); see
-        # implementation_markdown/CACHED_SPEC_GDN_INTEGRATION.md. When enabled,
-        # the GDN page grows to the same 5-tuple (fp32 checkpoint) and the spec
-        # verify path decodes through the circular cached kernel.
+        # Cached-SPEC decode kernel (gdn_replayssm_spec_decode). When enabled, the
+        # GDN page grows to the same 5-tuple (fp32 checkpoint) and the spec verify
+        # path decodes through the circular cached kernel.
         self.use_cache_spec_kernel = (
             self.cache_config.use_replayssm_spec
         )
@@ -1320,7 +1318,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         # Cached decode kernel (own kernel; independent of the packed-recurrent
-        # env flag). See implementation_markdown/CACHED_GDN_INTEGRATION.md.
+        # env flag).
         if self.use_cache_kernel and is_non_spec_decode:
             return self._forward_core_decode_non_spec_cached(
                 mixed_qkv=mixed_qkv,
@@ -1510,7 +1508,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # ``mixed_qkv_spec`` (q|k|v) + raw ``a``/``b`` (read per-request via
             # spec_query_start_loc, same as the baseline kernel). The d/k/g ring
             # caches + fp32 checkpoint live in the grown 5-tuple page; cursors
-            # are block-keyed in the metadata. See CACHED_SPEC_GDN_INTEGRATION.md.
+            # are block-keyed in the metadata.
             from vllm.model_executor.layers.fla.ops.gdn_replayssm_spec_decode import (
                 gdn_replayssm_spec_decode,
             )
@@ -1548,7 +1546,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 write_pos=attn_metadata.spec_write_pos_d,
                 cache_base=attn_metadata.spec_cache_base_d,
                 is_flush=attn_metadata.spec_is_flush_d,
-                max_cache_len=self.max_cache_len,
+                max_cache_len=self.max_cache_len + self.max_spec_len,
                 max_spec_len=self.max_spec_len,
                 scale=self.head_k_dim**-0.5,
                 use_qk_l2norm_in_kernel=True,
@@ -1810,7 +1808,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         Cached non-spec decode: amortizes the SSM-state HBM traffic by caching
         the per-step d/k/g vectors in a ring buffer and reconstructing the
         output from a checkpoint that is only rewritten every max_cache_len
-        steps. See implementation_markdown/CACHED_GDN_INTEGRATION.md.
+        steps.
         """
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         write_pos_d = attn_metadata.write_pos_d

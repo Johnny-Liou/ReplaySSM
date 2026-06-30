@@ -5,6 +5,7 @@
 import torch
 
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
+from vllm.model_executor.layers.mamba.ops.replayssm_config import get_replayssm_config
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -334,15 +335,6 @@ def _replayssm_output_only_kernel(
     tl.store(out_ptr + offs_m * stride_out_dim, out, mask=offs_m < dim)
 
 
-def _get_replayssm_output_only_launch_config(dstate: int) -> tuple[int, int]:
-    """Config sweep is stronly recommend for different dstate and hardware"""
-    if dstate <= 64:
-        return 16, 1
-    if dstate <= 128:
-        return 16, 1
-    return 16, 1
-
-
 def selective_state_update_replayssm_output_only(
     state: torch.Tensor,
     x: torch.Tensor,
@@ -436,7 +428,9 @@ def selective_state_update_replayssm_output_only(
 
     block_size_k_cache = max(1, triton.next_power_of_2(max_cache_len))
     block_size_k_dot = max(16, block_size_k_cache)
-    block_size_m, num_warps = _get_replayssm_output_only_launch_config(dstate)
+    block_size_m, num_warps = get_replayssm_config(
+        "mamba2_output_only", dstate=dstate, L=max_cache_len
+    )
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)

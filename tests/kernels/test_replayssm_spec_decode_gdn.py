@@ -9,6 +9,11 @@ each window position (causal). It does NOT write the state per draft -- only a
 flush step folds the *committed* history into the checkpoint, so unaccepted
 drafts can be rolled back.
 
+The history window is ``L = B + max_spec_len`` (block ``B`` = ``buffer_len``): the
+physical circular buffer is ``next_pow2(L)`` and ``max_cache_len`` passed to the
+kernel is the logical ``L`` (the history block ``BC = next_pow2(B)`` is derived
+inside the kernel).
+
 GDN's standard decode kernel (``fused_recurrent_gated_delta_rule_replayssm``) and
 the spec kernel SHARE the d/k/g cache layout (the spec one is circular via
 ``cache_base``; the standard one is linear). With ``cache_base=0`` they coincide,
@@ -23,10 +28,8 @@ For the multi-step rollback the ground truth is the baseline
 
 Precision: the spec kernel uses a chunked UT-transform whereas the standard /
 packed kernels use the sequential recurrence, so even at fp32 they differ by
-~1e-3 (an arithmetic-ordering difference, not a bug -- same regime as the GDN
-standard-decode test's state check). bf16 adds the usual rounding (rel ~1e-2),
-bounded per step and non-accumulating across the decode. State precision and
-activation/buffer precision are swept independently.
+~1e-3 (an arithmetic-ordering difference, not a bug). bf16 adds the usual rounding
+(rel ~1e-2), bounded per step and non-accumulating across the decode.
 """
 
 import pytest
@@ -45,6 +48,13 @@ from vllm.utils.torch_utils import set_random_seed
 
 DEV = "cuda"
 PAD_SLOT_ID = -1
+
+
+def _lbt(base_block: int, max_spec_len: int) -> tuple[int, int]:
+    """Logical flush threshold L = B + max_spec_len and physical pow2 buffer."""
+    L = base_block + max_spec_len
+    buf = 1 << (L - 1).bit_length()
+    return L, buf
 
 
 def _output_tol(both_fp32: bool) -> tuple[float, float]:
@@ -77,8 +87,8 @@ def _build_history(
     wp: int,
 ):
     """Run the standard decode for the first ``wp`` tokens into ``slot`` (no
-    flush, since wp <= buffer-max_spec_len < buffer-1), populating the shared
-    caches and leaving the checkpoint unchanged."""
+    flush, since wp <= B - max_spec_len < buf - 1), populating the shared caches
+    and leaving the checkpoint unchanged."""
     sbi = torch.tensor([slot], device=DEV, dtype=torch.int32)
     for t in range(wp):
         ot = torch.empty(1, 1, *state.shape[1:3], device=DEV, dtype=mqkv.dtype)
@@ -154,7 +164,7 @@ def _run_single_step(
     HV,
     K,
     V,
-    buffer_len,
+    buffer_len,  # history block B
     max_spec_len,
     wp,
     seed=0,
@@ -165,6 +175,7 @@ def _run_single_step(
     spec_len = max_spec_len
     scale = K**-0.5
     qkv_dim = 2 * H * K + HV * V
+    L, buf = _lbt(buffer_len, max_spec_len)
     both_fp32 = state_dtype == torch.float32 and act_dtype == torch.float32
     rtol, atol = _output_tol(both_fp32)
 
@@ -179,9 +190,9 @@ def _run_single_step(
     b = torch.randn(T_tot, HV, device=DEV, dtype=act_dtype)
     S0 = torch.randn(num_slots, HV, V, K, device=DEV, dtype=state_dtype) * 0.1
 
-    d_cache = torch.zeros(num_slots, HV, buffer_len, V, device=DEV, dtype=act_dtype)
-    k_cache = torch.zeros(num_slots, H, buffer_len, K, device=DEV, dtype=act_dtype)
-    g_cache = torch.zeros(num_slots, HV, buffer_len, device=DEV, dtype=torch.float32)
+    d_cache = torch.zeros(num_slots, HV, buf, V, device=DEV, dtype=act_dtype)
+    k_cache = torch.zeros(num_slots, H, buf, K, device=DEV, dtype=act_dtype)
+    g_cache = torch.zeros(num_slots, HV, buf, device=DEV, dtype=torch.float32)
 
     state = S0.clone()
     _build_history(
@@ -247,7 +258,7 @@ def _run_single_step(
         write_pos=write_pos,
         cache_base=cache_base,
         is_flush=is_flush,
-        max_cache_len=buffer_len,
+        max_cache_len=L,
         max_spec_len=max_spec_len,
         scale=scale,
         use_qk_l2norm_in_kernel=True,
@@ -258,9 +269,10 @@ def _run_single_step(
     torch.testing.assert_close(state_spec, S0, rtol=0, atol=0)
 
 
-def _wp_set(buffer_len: int, max_spec_len: int) -> list[int]:
-    C = buffer_len - 2 * max_spec_len
-    return sorted({0, max(0, C), buffer_len - max_spec_len})
+def _wp_set(base_block: int, max_spec_len: int) -> list[int]:
+    # Verify-path fills up to the max non-flush fill C = B - max_spec_len.
+    C = base_block - max_spec_len
+    return sorted({0, max(0, C // 2), max(0, C)})
 
 
 _PRECISIONS = [
@@ -276,21 +288,21 @@ _REAL_GEOMETRIES = [
     pytest.param((16, 32, 128, 128), id="qwen4b"),
     pytest.param((16, 64, 128, 128), id="qwen122b"),
 ]
-_BUFFERS = [16, 32]
+_BASE_BLOCKS = [16, 32]  # history block B (replayssm_buffer_len)
 _MAX_SPEC_LENS = [2, 4, 6, 8]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
 @pytest.mark.parametrize("precision", _PRECISIONS)
 @pytest.mark.parametrize("geometry", [_SMALL])
-@pytest.mark.parametrize("buffer_len", _BUFFERS)
+@pytest.mark.parametrize("base_block", _BASE_BLOCKS)
 @pytest.mark.parametrize("max_spec_len", _MAX_SPEC_LENS)
 def test_spec_step_matches_standard_decode(
-    precision, geometry, buffer_len, max_spec_len
+    precision, geometry, base_block, max_spec_len
 ):
     state_dtype, act_dtype = precision
     HQ, HV, K, V = geometry
-    for wp in _wp_set(buffer_len, max_spec_len):
+    for wp in _wp_set(base_block, max_spec_len):
         _run_single_step(
             state_dtype=state_dtype,
             act_dtype=act_dtype,
@@ -298,7 +310,7 @@ def test_spec_step_matches_standard_decode(
             HV=HV,
             K=K,
             V=V,
-            buffer_len=buffer_len,
+            buffer_len=base_block,
             max_spec_len=max_spec_len,
             wp=wp,
         )
@@ -310,8 +322,7 @@ def test_spec_step_matches_standard_decode(
 @pytest.mark.parametrize("max_spec_len", [2, 8])
 def test_spec_step_real_geometry(precision, geometry, max_spec_len):
     # Production Qwen3.5 GDN shapes (4B v_heads=32 / 122B-A10B v_heads=64) at the
-    # deployable buffer=16, both ends of the max_spec_len range (incl. the
-    # flush-every-step edge max_spec=8).
+    # deployable block B=16, both ends of the max_spec_len range.
     state_dtype, act_dtype = precision
     HQ, HV, K, V = geometry
     for wp in _wp_set(16, max_spec_len):
@@ -364,7 +375,7 @@ def _run_rollback(
     HV,
     K,
     V,
-    buffer_len,
+    buffer_len,  # history block B
     max_spec_len,
     num_steps=40,
     seed=0,
@@ -377,6 +388,7 @@ def _run_rollback(
     H = HQ
     scale = K**-0.5
     qkv_dim = 2 * H * K + HV * V
+    L, buf = _lbt(buffer_len, max_spec_len)
     both_fp32 = state_dtype == torch.float32 and act_dtype == torch.float32
     o_rtol, o_atol = _output_tol(both_fp32)
     s_rtol, s_atol = _state_tol(both_fp32)
@@ -389,9 +401,9 @@ def _run_rollback(
     state_spec = S0.clone()
     state_base = S0.clone()  # full pool; row in slot 1
 
-    d_cache = torch.zeros(num_slots, HV, buffer_len, V, device=DEV, dtype=act_dtype)
-    k_cache = torch.zeros(num_slots, H, buffer_len, K, device=DEV, dtype=act_dtype)
-    g_cache = torch.zeros(num_slots, HV, buffer_len, device=DEV, dtype=torch.float32)
+    d_cache = torch.zeros(num_slots, HV, buf, V, device=DEV, dtype=act_dtype)
+    k_cache = torch.zeros(num_slots, H, buf, K, device=DEV, dtype=act_dtype)
+    g_cache = torch.zeros(num_slots, HV, buf, device=DEV, dtype=torch.float32)
 
     write_pos = torch.zeros(num_slots, dtype=torch.int32, device=DEV)
     cache_base = torch.zeros(num_slots, dtype=torch.int32, device=DEV)
@@ -403,7 +415,7 @@ def _run_rollback(
         is_flush,
         torch.ones(1, dtype=torch.int32, device=DEV),
         sbi,
-        buffer_len,
+        L,
         max_spec_len,
     )
 
@@ -438,7 +450,7 @@ def _run_rollback(
             write_pos=write_pos,
             cache_base=cache_base,
             is_flush=is_flush,
-            max_cache_len=buffer_len,
+            max_cache_len=L,
             max_spec_len=max_spec_len,
             scale=scale,
             use_qk_l2norm_in_kernel=True,
@@ -476,7 +488,7 @@ def _run_rollback(
             is_flush,
             torch.tensor([k], device=DEV, dtype=torch.int32),
             sbi,
-            buffer_len,
+            L,
             max_spec_len,
         )
 
@@ -491,9 +503,9 @@ def _run_rollback(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
 @pytest.mark.parametrize("precision", _PRECISIONS)
-@pytest.mark.parametrize("buffer_len", _BUFFERS)
+@pytest.mark.parametrize("base_block", _BASE_BLOCKS)
 @pytest.mark.parametrize("max_spec_len", _MAX_SPEC_LENS)
-def test_spec_rollback_tracks_baseline(precision, buffer_len, max_spec_len):
+def test_spec_rollback_tracks_baseline(precision, base_block, max_spec_len):
     state_dtype, act_dtype = precision
     _run_rollback(
         state_dtype=state_dtype,
@@ -502,7 +514,7 @@ def test_spec_rollback_tracks_baseline(precision, buffer_len, max_spec_len):
         HV=4,
         K=64,
         V=64,
-        buffer_len=buffer_len,
+        buffer_len=base_block,
         max_spec_len=max_spec_len,
     )
 
@@ -521,9 +533,10 @@ def test_spec_continuous_batching(precision, with_padding):
     H = HQ
     scale = K**-0.5
     qkv_dim = 2 * H * K + HV * V
-    buffer_len = 16
+    base_block = 16
     max_spec_len = 4
     spec_len = max_spec_len
+    L, buf = _lbt(base_block, max_spec_len)
     both_fp32 = state_dtype == torch.float32 and act_dtype == torch.float32
     rtol, atol = _output_tol(both_fp32)
 
@@ -531,7 +544,8 @@ def test_spec_continuous_batching(precision, with_padding):
     padding = 2 if with_padding else 0
     padded_batch = batch + padding
     total_slots = 12
-    wps = [0, 4, buffer_len - max_spec_len]
+    C = base_block - max_spec_len
+    wps = [0, C // 2, C]
 
     A_log = torch.randn(HV, device=DEV, dtype=torch.float32)
     dt_bias = torch.randn(HV, device=DEV, dtype=torch.float32)
@@ -549,9 +563,9 @@ def test_spec_continuous_batching(precision, with_padding):
 
     S0 = torch.randn(total_slots, HV, V, K, device=DEV, dtype=state_dtype) * 0.1
     state_spec = S0.clone()
-    d_cache = torch.zeros(total_slots, HV, buffer_len, V, device=DEV, dtype=act_dtype)
-    k_cache = torch.zeros(total_slots, H, buffer_len, K, device=DEV, dtype=act_dtype)
-    g_cache = torch.zeros(total_slots, HV, buffer_len, device=DEV, dtype=torch.float32)
+    d_cache = torch.zeros(total_slots, HV, buf, V, device=DEV, dtype=act_dtype)
+    k_cache = torch.zeros(total_slots, H, buf, K, device=DEV, dtype=act_dtype)
+    g_cache = torch.zeros(total_slots, HV, buf, device=DEV, dtype=torch.float32)
 
     write_pos = torch.zeros(total_slots, dtype=torch.int32, device=DEV)
     cache_base = torch.zeros(total_slots, dtype=torch.int32, device=DEV)
@@ -632,7 +646,7 @@ def test_spec_continuous_batching(precision, with_padding):
         write_pos=write_pos,
         cache_base=cache_base,
         is_flush=is_flush,
-        max_cache_len=buffer_len,
+        max_cache_len=L,
         max_spec_len=max_spec_len,
         scale=scale,
         use_qk_l2norm_in_kernel=True,

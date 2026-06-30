@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.replayssm_config import get_replayssm_config
 from vllm.triton_utils import tl, triton
 
 
@@ -378,17 +379,8 @@ def _advance_gdn_spec_cursors_kernel(
     new_wp = tl.where(is_flush_cur != 0, total_commit, write_pos + total_commit).to(
         tl.int32
     )
-    # EARLY-FLUSH (margin = 2 * max_spec_len, strict '>'): flush one window early
-    # so that on every verify step write_pos + spec_len <= max_cache_len holds,
-    # i.e. the spec window NEVER overflows the circular cache. This is required
-    # for e2e correctness: the proposer (n-gram / MTP) cannot be told to cap its
-    # draft count, and the rejection sampler reads logits for EVERY window
-    # position -- so an overflowing position would feed the sampler an
-    # uninitialized-`out` garbage logit (emitting a wrong token) and desync the
-    # committed state. The strict '>' uses the buffer exactly (max write_pos at a
-    # flush step = max_cache_len - max_spec_len, zero headroom); usable committed
-    # history is max_cache_len - 2*max_spec_len + 1; raise replayssm_buffer_len
-    # for more. Config enforces max_cache_len >= 2 * max_spec_len.
+    # Early-flush one window early so every verify step satisfies
+    # write_pos + spec_len <= max_cache_len (the spec window never overflows).
     next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) > MAX_CACHE_LEN).to(tl.int8)
 
     tl.store(write_pos_ptr + blk, new_wp, mask=valid)
@@ -457,7 +449,6 @@ def _launch_gdn_spec(
     num_warps,
     num_stages,
     nk,
-    bs_min,
     null_block_id,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
@@ -465,10 +456,10 @@ def _launch_gdn_spec(
     q_dim = (qkv_dim - HV * V) // 2
     H = q_dim // K
     B = query_start_loc.shape[0] - 1
-    assert max_cache_len & (max_cache_len - 1) == 0, (
-        "circular cache requires power-of-two max_cache_len"
-    )
-    assert d_cache.shape[2] == max_cache_len
+    # max_cache_len is the logical flush threshold L; the physical pow2 ring is
+    # d_cache.shape[2] = next_pow2(L) and wraps addresses / per-head strides.
+    buf = d_cache.shape[2]
+    assert buf & (buf - 1) == 0, "circular cache requires power-of-two buffer"
 
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:
@@ -479,8 +470,11 @@ def _launch_gdn_spec(
     if BKT < 16:
         raise ValueError(f"BKT={BKT} must be >=16 for tl.dot.")
     BV = block_v if block_v is not None else min(triton.next_power_of_2(V), 64)
-    BS = max(bs_min, triton.next_power_of_2(max_spec_len))
-    BC = max(16, triton.next_power_of_2(max_cache_len))
+    BS = max(4, triton.next_power_of_2(max_spec_len))
+    # History block decoupled from the physical buffer: with L = B + max_spec_len
+    # committed history never exceeds L - max_spec_len, so BC covers it while
+    # staying small (the L=B+T win).
+    BC = max(16, triton.next_power_of_2(max(1, max_cache_len - max_spec_len)))
 
     grid = (triton.cdiv(V, BV), B, HV)
     gdn_replayssm_spec_circular_kernel[grid](
@@ -521,7 +515,7 @@ def _launch_gdn_spec(
         BC=BC,
         NK=nk,
         BKT=BKT,
-        MAX_CACHE_LEN=max_cache_len,
+        MAX_CACHE_LEN=buf,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_FLUSH=is_flush_kernel,
@@ -538,59 +532,50 @@ def gdn_replayssm_spec_decode(
     A_log: torch.Tensor,  # [HV] fp32
     dt_bias: torch.Tensor,  # [HV] fp32
     checkpoint_state: torch.Tensor,  # [num_slots, HV, V, K]  (in-place h0==ht)
-    d_cache: torch.Tensor,  # [num_slots, HV, L, V]
-    k_cache: torch.Tensor,  # [num_slots, H, L, K]
-    g_cache: torch.Tensor,  # [num_slots, HV, L]  fp32
+    d_cache: torch.Tensor,  # [num_slots, HV, buf, V]
+    k_cache: torch.Tensor,  # [num_slots, H, buf, K]
+    g_cache: torch.Tensor,  # [num_slots, HV, buf]  fp32
     out: torch.Tensor,  # [total_tokens, HV, V]  preallocated
     query_start_loc: torch.Tensor,  # [B+1] int
     ssm_state_indices: torch.Tensor,  # [B] int  physical block per request
     write_pos: torch.Tensor,  # [num_slots] int32  block-keyed
     cache_base: torch.Tensor,  # [num_slots] int32  block-keyed
     is_flush: torch.Tensor,  # [num_slots] int8  block-keyed
-    max_cache_len: int,
+    max_cache_len: int,  # logical flush threshold L = B + max_spec_len
     max_spec_len: int,
     scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
-    block_v: int = 64,
-    num_warps: int = 1,
-    num_stages: int = 2,
-    nk: int = 2,
-    bs_min: int = 4,
-    block_v_flush: int = 64,
-    num_warps_flush: int = 1,
-    num_stages_flush: int = 2,
-    nk_flush: int = 2,
     launch_mode: str = "both",
 ):
     """GDN cached speculative-decode on a CIRCULAR d/k/g cache (vLLM packed varlen).
 
-    Two launches (verify + flush ``IS_FLUSH`` specializations); device-side
-    per-row routing keeps the step CUDA-graph capturable. Cursors are block-keyed
-    (indexed by ``ssm_state_indices``) and advanced out-of-kernel by
-    :func:`commit_gdn_replayssm_spec`.
+    ``max_cache_len`` is the logical flush threshold L = B + max_spec_len; the
+    physical pow2 buffer is ``d_cache.shape[2]`` = ``next_pow2(L)`` and the history
+    block ``BC = next_pow2(L - max_spec_len)``. Two launches (verify + flush
+    ``IS_FLUSH`` specializations) with device-side per-row routing keep the step
+    CUDA-graph capturable. Cursors are advanced by ``commit_gdn_replayssm_spec``.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
+    vb, vw, vnk, vns = get_replayssm_config("gdn_spec_verify", max_spec_len=max_spec_len)
+    fb, fw, fnk, fns = get_replayssm_config("gdn_spec_flush", max_spec_len=max_spec_len)
 
     if launch_mode in ("both", "verify"):
         _launch_gdn_spec(
             mixed_qkv, a, b, A_log, dt_bias, out, checkpoint_state,
             d_cache, k_cache, g_cache, query_start_loc, ssm_state_indices,
             write_pos, cache_base, is_flush, scale, max_cache_len, max_spec_len,
-            use_qk_l2norm_in_kernel, False,
-            block_v, num_warps, num_stages, nk, bs_min, null_block_id,
+            use_qk_l2norm_in_kernel, False, vb, vw, vns, vnk, null_block_id,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
             mixed_qkv, a, b, A_log, dt_bias, out, checkpoint_state,
             d_cache, k_cache, g_cache, query_start_loc, ssm_state_indices,
             write_pos, cache_base, is_flush, scale, max_cache_len, max_spec_len,
-            use_qk_l2norm_in_kernel, True,
-            block_v_flush, num_warps_flush, num_stages_flush, nk_flush, bs_min,
-            null_block_id,
+            use_qk_l2norm_in_kernel, True, fb, fw, fns, fnk, null_block_id,
         )
     return out
 
@@ -601,14 +586,14 @@ def commit_gdn_replayssm_spec(
     is_flush: torch.Tensor,
     num_accepted: torch.Tensor,  # [n_rows] int  (already includes the bonus token)
     state_batch_indices: torch.Tensor,  # [n_rows] int  physical block per row
-    max_cache_len: int,
+    max_cache_len: int,  # logical flush threshold L
     max_spec_len: int,
-    cache_buf_len: int | None = None,
+    cache_buf_len: int | None = None,  # physical pow2 buffer next_pow2(L)
     null_block_id: int = 0,
 ):
     """Advance the block-keyed cursors once per decode step (device-only)."""
     if cache_buf_len is None:
-        cache_buf_len = max_cache_len
+        cache_buf_len = triton.next_power_of_2(max_cache_len)
     n_rows = state_batch_indices.shape[0]
     BLOCK = triton.next_power_of_2(max(1, n_rows))
     _advance_gdn_spec_cursors_kernel[(1,)](
@@ -641,7 +626,6 @@ def reset_gdn_replayssm_spec_cursors(
     """Reset the cursors of first-decode rows (prefill->decode handoff)."""
     n_rows = state_batch_indices.shape[0]
     BLOCK = triton.next_power_of_2(max(1, n_rows))
-    # Early-flush margin (2 * max_spec_len, strict '>'): mirror _advance_gdn_spec_cursors_kernel.
     init_flush = 1 if 2 * max_spec_len > max_cache_len else 0
     _reset_gdn_replayssm_spec_cursors_kernel[(1,)](
         write_pos,

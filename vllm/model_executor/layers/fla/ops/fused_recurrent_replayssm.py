@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.replayssm_config import (
+    get_replayssm_config,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -169,9 +172,9 @@ def fused_recurrent_gated_delta_rule_replayssm(
     write_pos: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
     block_v: int | None = None,
-    num_warps: int = 1,
-    num_stages: int = 3,
-    nk: int = 2,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+    nk: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cached GDN autoregressive decode (one new token per sequence).
 
@@ -213,6 +216,21 @@ def fused_recurrent_gated_delta_rule_replayssm(
     if H <= 0 or HV % H != 0:
         raise ValueError(f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}.")
     max_cache_len = d_cache.shape[2]
+
+    # Launch config (block_v, num_warps, num_stages, nk) from the L-keyed config
+    # module; explicit kwargs override. Lets benchmarks/the config sweep pin it via
+    # override_replayssm_config("gdn_decode", ...).
+    cfg_bv, cfg_nw, cfg_ns, cfg_nk = get_replayssm_config(
+        "gdn_decode", L=max_cache_len
+    )
+    if block_v is None:
+        block_v = cfg_bv
+    if num_warps is None:
+        num_warps = cfg_nw
+    if num_stages is None:
+        num_stages = cfg_ns
+    if nk is None:
+        nk = cfg_nk
 
     # Cache shape sanity (per state slot): d=(HV, L, V), k=(H, L, K), g=(HV, L).
     if tuple(d_cache.shape[1:]) != (HV, max_cache_len, V):

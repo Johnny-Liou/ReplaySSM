@@ -9,6 +9,11 @@ the buffer up to its own position). It does NOT write the state per draft -- onl
 a flush step folds the *committed* history into the checkpoint, so unaccepted
 drafts can be rolled back.
 
+The history window is ``L = B + max_spec_len`` (block ``B`` = ``buffer_len``): the
+physical circular buffer is ``next_pow2(L)`` and ``max_cache_len`` passed to the
+kernel is the logical ``L``. Verify launches the non-flush kernel; flush launches
+the reconstruct kernel; both run every step with device-side row routing.
+
 Oracle (no separate spec reference needed): the already-verified ReplaySSM
 STANDARD decode kernel (``selective_state_update_replayssm_output_only``) stepped
 one token at a time over the SAME window from the SAME checkpoint+buffer, with
@@ -17,10 +22,9 @@ Its per-position output must equal the spec kernel's. For the multi-step rollbac
 the ground truth is the baseline ``selective_state_update`` decode of the accepted
 token stream (it writes the full state every step).
 
-Three checks per (precision, geometry, buffer_len, max_spec_len):
+Three checks per (precision, geometry, base_block, max_spec_len):
   * single spec step output == standard-decode-of-window, swept over the buffer
-    fill level (incl. the early-flush boundary and the tight buffer=2*max_spec_len
-    edge),
+    fill level up to the max non-flush fill C = B - max_spec_len,
   * a 40-step rollback with a random accepted count k per step: accepted-position
     outputs track the baseline decode, and the committed checkpoint at each flush
     matches the baseline state at the matching folded-token count,
@@ -30,10 +34,8 @@ Three checks per (precision, geometry, buffer_len, max_spec_len):
 Precision: the checkpoint-readout dot is keyed on the activation dtype -- tf32x3
 (~fp32 parity, 3-pass) for fp32 activations, single-pass tf32 for bf16 -- and the
 cache GEMM uses tf32x3, so fp32 is near-exact (rel ~1e-6, tight tolerance). At bf16
-activations the bf16 ``C``/``x``/``B`` operands dominate (the fp32 checkpoint stays
-fp32 into the dot), giving a small, EXPECTED gap (rel ~5e-3) that is bounded per
-step and non-accumulating across the decode. State precision and activation/buffer
-precision are swept independently.
+activations the bf16 ``C``/``x``/``B`` operands dominate (rel ~5e-3), a small
+EXPECTED gap that is bounded per step and non-accumulating across the decode.
 """
 
 import pytest
@@ -52,6 +54,13 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 DEV = "cuda"
+
+
+def _lbt(base_block: int, max_spec_len: int) -> tuple[int, int]:
+    """Logical flush threshold L = B + max_spec_len and physical pow2 buffer."""
+    L = base_block + max_spec_len
+    buf = 1 << (L - 1).bit_length()
+    return L, buf
 
 
 def _tolerances(both_fp32: bool) -> tuple[float, float]:
@@ -179,7 +188,7 @@ def _run_single_step(
     headdim,
     dstate,
     ngroups,
-    buffer_len,
+    buffer_len,  # history block B
     max_spec_len,
     wp,
     has_z,
@@ -191,6 +200,7 @@ def _run_single_step(
     H, P, N, G = nheads, headdim, dstate, ngroups
     d_inner = H * P
     spec_len = max_spec_len
+    L, buf = _lbt(buffer_len, max_spec_len)
     both_fp32 = state_dtype == torch.float32 and act_dtype == torch.float32
     rtol, atol = _tolerances(both_fp32)
 
@@ -221,7 +231,7 @@ def _run_single_step(
         dt_softplus=dt_softplus,
         wp=wp,
         spec_len=spec_len,
-        buffer_len=buffer_len,
+        buffer_len=buf,
         act_dtype=act_dtype,
     )
 
@@ -229,9 +239,9 @@ def _run_single_step(
     state_spec = S0.clone()
     conv_dim = d_inner + 2 * G * N
     post_conv_cache = torch.zeros(
-        num_blocks, buffer_len, conv_dim, device=DEV, dtype=act_dtype
+        num_blocks, buf, conv_dim, device=DEV, dtype=act_dtype
     )
-    dt_cache = torch.zeros(num_blocks, H, buffer_len, device=DEV, dtype=torch.float32)
+    dt_cache = torch.zeros(num_blocks, H, buf, device=DEV, dtype=torch.float32)
     _scatter_packed_history(
         post_conv_cache, dt_cache, 1, x[:wp], B[:wp], C[:wp], dt[:wp], d_inner, G, N
     )
@@ -261,7 +271,7 @@ def _run_single_step(
         is_flush=is_flush,
         query_start_loc=qsl,
         state_batch_indices=sbi,
-        max_cache_len=buffer_len,
+        max_cache_len=L,
         max_spec_len=max_spec_len,
         d_inner=d_inner,
         ngroups=G,
@@ -278,12 +288,11 @@ def _run_single_step(
     torch.testing.assert_close(state_spec, S0, rtol=0, atol=0)
 
 
-def _wp_set(buffer_len: int, max_spec_len: int) -> list[int]:
-    # 0 (empty buffer = pure checkpoint readout), the max non-flush fill C, and
-    # the max possible fill buffer-max_spec_len (window ends exactly at the buffer
-    # end -- the tightest reconstruction edge).
-    C = buffer_len - 2 * max_spec_len
-    return sorted({0, max(0, C), buffer_len - max_spec_len})
+def _wp_set(base_block: int, max_spec_len: int) -> list[int]:
+    # Verify-path fills: 0 (empty buffer = pure checkpoint readout), the max
+    # non-flush fill C = B - max_spec_len (the tightest edge), and a midpoint.
+    C = base_block - max_spec_len
+    return sorted({0, max(0, C // 2), max(0, C)})
 
 
 _PRECISIONS = [
@@ -291,7 +300,7 @@ _PRECISIONS = [
     pytest.param((torch.float32, torch.bfloat16), id="s32_a16"),
     pytest.param((torch.bfloat16, torch.bfloat16), id="s16_a16"),
 ]
-# (nheads, headdim, dstate, ngroups). The full precision x buffer x max_spec_len
+# (nheads, headdim, dstate, ngroups). The full precision x block x max_spec_len
 # sweep runs on the small shapes (cheap compiles); the production Nemotron-3
 # Mamba2 shapes are exercised by test_spec_step_real_geometry.
 _SMALL = pytest.param((8, 64, 64, 4), id="small")
@@ -301,24 +310,23 @@ _REAL_GEOMETRIES = [
     pytest.param((128, 64, 128, 8), id="super120b"),
     pytest.param((256, 64, 128, 8), id="ultra550b"),
 ]
-_BUFFERS = [16, 32]
+_BASE_BLOCKS = [16, 32]  # history block B (replayssm_buffer_len)
 _MAX_SPEC_LENS = [2, 4, 6, 8]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
 @pytest.mark.parametrize("precision", _PRECISIONS)
 @pytest.mark.parametrize("geometry", [_SMALL, _TINY])
-@pytest.mark.parametrize("buffer_len", _BUFFERS)
+@pytest.mark.parametrize("base_block", _BASE_BLOCKS)
 @pytest.mark.parametrize("max_spec_len", _MAX_SPEC_LENS)
 @pytest.mark.parametrize("has_z", [False, True])
 def test_spec_step_matches_standard_decode(
-    precision, geometry, buffer_len, max_spec_len, has_z
+    precision, geometry, base_block, max_spec_len, has_z
 ):
-    # buffer_len >= 2*max_spec_len always holds for these combos (tightest is
-    # buffer=16, max_spec_len=8). Sweep the fill level incl. the flush boundary.
+    # base_block >= max_spec_len always holds here. Sweep the non-flush fill level.
     state_dtype, act_dtype = precision
     nheads, headdim, dstate, ngroups = geometry
-    for wp in _wp_set(buffer_len, max_spec_len):
+    for wp in _wp_set(base_block, max_spec_len):
         _run_single_step(
             state_dtype=state_dtype,
             act_dtype=act_dtype,
@@ -326,7 +334,7 @@ def test_spec_step_matches_standard_decode(
             headdim=headdim,
             dstate=dstate,
             ngroups=ngroups,
-            buffer_len=buffer_len,
+            buffer_len=base_block,
             max_spec_len=max_spec_len,
             wp=wp,
             has_z=has_z,
@@ -339,8 +347,7 @@ def test_spec_step_matches_standard_decode(
 @pytest.mark.parametrize("max_spec_len", [2, 8])
 def test_spec_step_real_geometry(precision, geometry, max_spec_len):
     # Production Nemotron-3 Mamba2 shapes (Nano-4B / Super-120B / Ultra-550B) at
-    # the deployable buffer=16, both ends of the max_spec_len range (incl. the
-    # flush-every-step edge max_spec=8).
+    # the deployable block B=16, both ends of the max_spec_len range.
     state_dtype, act_dtype = precision
     nheads, headdim, dstate, ngroups = geometry
     for wp in _wp_set(16, max_spec_len):
@@ -398,7 +405,7 @@ def _run_rollback(
     headdim,
     dstate,
     ngroups,
-    buffer_len,
+    buffer_len,  # history block B
     max_spec_len,
     num_steps=40,
     has_z=True,
@@ -411,6 +418,7 @@ def _run_rollback(
     set_random_seed(seed)
     H, P, N, G = nheads, headdim, dstate, ngroups
     d_inner = H * P
+    L, buf = _lbt(buffer_len, max_spec_len)
     both_fp32 = state_dtype == torch.float32 and act_dtype == torch.float32
     rtol, atol = _tolerances(both_fp32)
 
@@ -425,9 +433,9 @@ def _run_rollback(
 
     conv_dim = d_inner + 2 * G * N
     post_conv_cache = torch.zeros(
-        num_blocks, buffer_len, conv_dim, device=DEV, dtype=act_dtype
+        num_blocks, buf, conv_dim, device=DEV, dtype=act_dtype
     )
-    dt_cache = torch.zeros(num_blocks, H, buffer_len, device=DEV, dtype=torch.float32)
+    dt_cache = torch.zeros(num_blocks, H, buf, device=DEV, dtype=torch.float32)
     write_pos = torch.zeros(num_blocks, dtype=torch.int32, device=DEV)
     post_origin = torch.zeros(num_blocks, dtype=torch.int32, device=DEV)
     is_flush = torch.zeros(num_blocks, dtype=torch.int8, device=DEV)
@@ -438,7 +446,7 @@ def _run_rollback(
         is_flush,
         torch.ones(1, dtype=torch.int8, device=DEV),
         sbi,
-        buffer_len,
+        L,
         max_spec_len,
     )
 
@@ -474,7 +482,7 @@ def _run_rollback(
             is_flush=is_flush,
             query_start_loc=qsl,
             state_batch_indices=sbi,
-            max_cache_len=buffer_len,
+            max_cache_len=L,
             max_spec_len=max_spec_len,
             d_inner=d_inner,
             ngroups=G,
@@ -522,7 +530,7 @@ def _run_rollback(
             is_flush,
             torch.tensor([k], device=DEV, dtype=torch.int32),
             sbi,
-            buffer_len,
+            L,
             max_spec_len,
         )
 
@@ -539,9 +547,9 @@ def _run_rollback(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
 @pytest.mark.parametrize("precision", _PRECISIONS)
-@pytest.mark.parametrize("buffer_len", _BUFFERS)
+@pytest.mark.parametrize("base_block", _BASE_BLOCKS)
 @pytest.mark.parametrize("max_spec_len", _MAX_SPEC_LENS)
-def test_spec_rollback_tracks_baseline(precision, buffer_len, max_spec_len):
+def test_spec_rollback_tracks_baseline(precision, base_block, max_spec_len):
     state_dtype, act_dtype = precision
     _run_rollback(
         state_dtype=state_dtype,
@@ -550,7 +558,7 @@ def test_spec_rollback_tracks_baseline(precision, buffer_len, max_spec_len):
         headdim=64,
         dstate=64,
         ngroups=4,
-        buffer_len=buffer_len,
+        buffer_len=base_block,
         max_spec_len=max_spec_len,
     )
 
@@ -568,9 +576,10 @@ def test_spec_continuous_batching(precision, with_padding):
     H, P, N, G = 4, 64, 16, 2
     d_inner = H * P
     conv_dim = d_inner + 2 * G * N
-    buffer_len = 16
+    base_block = 16
     max_spec_len = 4
     spec_len = max_spec_len
+    L, buf = _lbt(base_block, max_spec_len)
     both_fp32 = state_dtype == torch.float32 and act_dtype == torch.float32
     rtol, atol = _tolerances(both_fp32)
 
@@ -578,7 +587,8 @@ def test_spec_continuous_batching(precision, with_padding):
     padding = 2 if with_padding else 0
     padded_batch = batch + padding
     total_slots = 12
-    wps = [0, 4, buffer_len - max_spec_len]  # staggered fills incl. tight edge
+    C = base_block - max_spec_len
+    wps = [0, C // 2, C]  # staggered non-flush fills incl. the tight edge
 
     A = _tied_A(H, P, N)
     dt_bias = torch.rand(H, device=DEV) - 4.0
@@ -599,9 +609,9 @@ def test_spec_continuous_batching(precision, with_padding):
     S0 = torch.randn(total_slots, H, P, N, device=DEV, dtype=state_dtype) * 0.1
     state_spec = S0.clone()
     post_conv_cache = torch.zeros(
-        total_slots, buffer_len, conv_dim, device=DEV, dtype=act_dtype
+        total_slots, buf, conv_dim, device=DEV, dtype=act_dtype
     )
-    dt_cache = torch.zeros(total_slots, H, buffer_len, device=DEV, dtype=torch.float32)
+    dt_cache = torch.zeros(total_slots, H, buf, device=DEV, dtype=torch.float32)
     write_pos = torch.zeros(total_slots, dtype=torch.int32, device=DEV)
     post_origin = torch.zeros(total_slots, dtype=torch.int32, device=DEV)
     is_flush = torch.zeros(total_slots, dtype=torch.int8, device=DEV)
@@ -636,7 +646,7 @@ def test_spec_continuous_batching(precision, with_padding):
                 dt_softplus=True,
                 wp=wp,
                 spec_len=spec_len,
-                buffer_len=buffer_len,
+                buffer_len=buf,
                 act_dtype=act_dtype,
             )
         )
@@ -678,7 +688,7 @@ def test_spec_continuous_batching(precision, with_padding):
         is_flush=is_flush,
         query_start_loc=qsl,
         state_batch_indices=sbi,
-        max_cache_len=buffer_len,
+        max_cache_len=L,
         max_spec_len=max_spec_len,
         d_inner=d_inner,
         ngroups=G,

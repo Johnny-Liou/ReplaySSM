@@ -72,7 +72,7 @@ class GDNAttentionMetadata:
     # Cached-SPEC decode cursors: persistent, block-keyed (full (num_blocks,)
     # fixed-address buffers indexed by spec_state_indices_tensor[:, 0]), advanced
     # once per step by commit_gdn_replayssm_spec. None unless
-    # use_replayssm_spec is enabled. See CACHED_SPEC_GDN_INTEGRATION.md.
+    # use_replayssm_spec is enabled.
     spec_write_pos_d: torch.Tensor | None = None
     spec_cache_base_d: torch.Tensor | None = None
     spec_is_flush_d: torch.Tensor | None = None
@@ -179,8 +179,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         # Cached decode kernel: persistent per-decode-row ring write position.
         # write_pos is derived per request each step (decode_step % max_cache_len)
-        # so recycled paged blocks need no zero-init; see
-        # implementation_markdown/CACHED_GDN_INTEGRATION.md.
+        # so recycled paged blocks need no zero-init.
         self.use_cached_kernel: bool = (
             vllm_config.cache_config.use_replayssm
         )
@@ -194,12 +193,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         # Cached-SPEC decode: block-keyed cursors (sized num_gpu_blocks),
         # allocated lazily on first build (num_gpu_blocks is unknown here), and
-        # advanced once per step by commit_gdn_replayssm_spec. See
-        # implementation_markdown/CACHED_SPEC_GDN_INTEGRATION.md.
+        # advanced once per step by commit_gdn_replayssm_spec.
         self.use_cache_spec_kernel: bool = (
             vllm_config.cache_config.use_replayssm_spec
         )
         self.max_spec_len: int = 1 + self.num_spec
+        # L = B + max_spec_len history window; physical pow2 ring = next_pow2(L).
+        self.spec_flush_threshold = self.max_cache_len + self.max_spec_len
+        self.spec_cache_buf_len = 1 << (self.spec_flush_threshold - 1).bit_length()
         self.cursor_device = device
         self.spec_write_pos: torch.Tensor | None = None
         self.spec_cache_base: torch.Tensor | None = None
@@ -452,7 +453,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         # Cached decode kernel: derive the per-request ring write position
         # (write_pos = decode_step % max_cache_len). Only the non-spec decode
-        # path runs the cached kernel; see CACHED_GDN_INTEGRATION.md.
+        # path runs the cached kernel.
         write_pos_d = None
         spec_write_pos_d = None
         spec_cache_base_d = None
@@ -528,9 +529,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 self.spec_is_flush,
                 num_accepted_tokens.to(torch.int32),
                 sbi,
-                max_cache_len=self.max_cache_len,
+                max_cache_len=self.spec_flush_threshold,
                 max_spec_len=self.max_spec_len,
-                cache_buf_len=self.max_cache_len,
+                cache_buf_len=self.spec_cache_buf_len,
             )
             # prefill->decode reset for first-decode rows (cursors only; conv
             # context lives in conv_state). A request's first spec verify has
@@ -555,7 +556,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     self.spec_is_flush,
                     first_decode_d,
                     sbi,
-                    max_cache_len=self.max_cache_len,
+                    max_cache_len=self.spec_flush_threshold,
                     max_spec_len=self.max_spec_len,
                 )
             spec_write_pos_d = self.spec_write_pos

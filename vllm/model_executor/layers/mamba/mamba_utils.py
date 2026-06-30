@@ -352,10 +352,10 @@ class MambaStateShapeCalculator:
         size ``conv_kernel-1+num_spec`` -- the hybrid reuses
         ``causal_conv1d_update``); otherwise appends the circular caches
         ``post_conv_cache=(cache_buf_len, conv_dim_local)`` and
-        ``dt_cache=(local_nheads, cache_buf_len)``, where
-        ``cache_buf_len = next_pow2(replayssm_buffer_len)`` and ``conv_dim_local``
-        matches the post-conv x|B|C width. Must stay in sync with
-        ``MambaMixer2.get_state_shape``.
+        ``dt_cache=(local_nheads, cache_buf_len)``, where the L = B + max_spec_len
+        history window sizes ``cache_buf_len = next_pow2(replayssm_buffer_len + 1 +
+        num_spec)`` and ``conv_dim_local`` matches the post-conv x|B|C width. Must
+        stay in sync with ``MambaMixer2.get_state_shape``.
         """
         conv_state_shape, temporal_state_shape = cls.mamba2_state_shape(
             tp_world_size=tp_world_size,
@@ -375,7 +375,8 @@ class MambaStateShapeCalculator:
         conv_dim_local = divide(
             intermediate_size + 2 * n_groups_ext * state_size, tp_world_size
         )
-        cache_buf_len = 1 << (replayssm_buffer_len - 1).bit_length()
+        # L = B + max_spec_len history window: physical pow2 buffer next_pow2(L).
+        cache_buf_len = 1 << (replayssm_buffer_len + num_spec).bit_length()
         local_nheads = divide(num_heads, tp_world_size)
         post_conv_cache_shape = (cache_buf_len, conv_dim_local)
         dt_cache_shape = (local_nheads, cache_buf_len)
@@ -494,22 +495,35 @@ class MambaStateShapeCalculator:
     ) -> tuple[tuple[int, ...], ...]:
         """GDN state shapes for the cached SPECULATIVE-decode kernel.
 
-        Identical page to the non-spec cached path -- the circular spec kernel
-        reuses ``d_cache``/``k_cache``/``g_cache`` plus the (fp32) ``ssm``
-        checkpoint. Returns the baseline ``(conv, ssm)`` shapes when the flag is
-        off. The block-keyed cursors (``write_pos``/``cache_base``/``is_flush``)
-        live in the GDN metadata builder, not the paged page.
+        The circular ``d_cache``/``k_cache``/``g_cache`` use the L = B + max_spec_len
+        history window: a power-of-two buffer ``next_pow2(replayssm_buffer_len + 1 +
+        num_spec)``. Returns the baseline ``(conv, ssm)`` shapes when the flag is
+        off. The block-keyed cursors live in the GDN metadata builder, not the page.
         """
-        return cls.gated_delta_net_cached_state_shape(
+        conv_state_shape, temporal_state_shape = cls.gated_delta_net_state_shape(
             tp_world_size,
             num_k_heads,
             num_v_heads,
             head_k_dim,
             head_v_dim,
             conv_kernel_size,
-            use_replayssm_spec,
-            replayssm_buffer_len,
             num_spec,
+        )
+        if not use_replayssm_spec:
+            return conv_state_shape, temporal_state_shape
+
+        cache_buf_len = 1 << (replayssm_buffer_len + num_spec).bit_length()
+        local_v_heads = divide(num_v_heads, tp_world_size)
+        local_k_heads = divide(num_k_heads, tp_world_size)
+        d_cache_shape = (local_v_heads, cache_buf_len, head_v_dim)
+        k_cache_shape = (local_k_heads, cache_buf_len, head_k_dim)
+        g_cache_shape = (local_v_heads, cache_buf_len)
+        return (
+            conv_state_shape,
+            temporal_state_shape,
+            d_cache_shape,
+            k_cache_shape,
+            g_cache_shape,
         )
 
     @classmethod
