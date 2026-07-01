@@ -22,6 +22,9 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     stride_init_state_token: tl.constexpr,
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
+    stride_d_slot: tl.constexpr,
+    stride_k_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BK: tl.constexpr, BV: tl.constexpr, BC: tl.constexpr,
     NK: tl.constexpr, BKT: tl.constexpr,
@@ -62,7 +65,7 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
 
     # Replay decay over the committed cache, from the cached per-step gates g.
-    p_g_main = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c
+    p_g_main = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + o_c
     b_g_all = tl.load(p_g_main, mask=cache_valid, other=0.0).to(tl.float32)
     b_g_prefix = tl.cumsum(b_g_all, axis=0)
     b_g_total = tl.sum(b_g_all, axis=0)
@@ -70,7 +73,7 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     b_total_decay = tl.exp(b_g_total)
 
     # Cached delta-rule update vectors d (K-independent), scaled by the replay decay.
-    p_d_main = d_cache + (((state_idx * HV + i_hv) * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None])
+    p_d_main = d_cache + state_idx * stride_d_slot + ((i_hv * MAX_CACHE_LEN + o_c[None, :]) * V + o_v[:, None])
     b_d_all = tl.load(p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0).to(tl.float32)
     b_d_scaled_tc = (b_d_all * b_replay_decay[None, :]).to(p_o.dtype.element_ty)  # [BV, BC]
 
@@ -110,7 +113,7 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
         # Reconstruct this K tile of the state: S = total_decay * S_0 + d_scaled . k_cache.
         p_h0_c = h0 + state_idx * stride_init_state_token + i_hv * V * K + o_v[:, None] * K + o_kt[None, :]
         b_h0_c = tl.load(p_h0_c, mask=mask_v[:, None] & mask_kt[None, :], other=0).to(tl.float32)
-        p_k_c = k_cache + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K + o_kt[None, :]
+        p_k_c = k_cache + state_idx * stride_k_slot + ((i_h * MAX_CACHE_LEN + o_c[:, None]) * K + o_kt[None, :])
         b_k_all_c = tl.load(p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0).to(p_o.dtype.element_ty)
         b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_scaled_tc, b_k_all_c).to(tl.float32)  # [BV, BKT]
 
@@ -119,7 +122,7 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
         b_state_k += tl.sum(b_h_c * k_c[None, :], axis=1)
 
         if write_k:
-            p_cur_k = k_cache + ((state_idx * H + i_h) * MAX_CACHE_LEN + b_write_pos) * K + o_kt
+            p_cur_k = k_cache + state_idx * stride_k_slot + ((i_h * MAX_CACHE_LEN + b_write_pos) * K + o_kt)
             tl.store(p_cur_k, k_c.to(p_o.dtype.element_ty), mask=mask_kt & (b_write_pos < MAX_CACHE_LEN))
 
     # Current-token output: alpha*(S q) + d_cur * (k . q), with the new update
@@ -140,7 +143,7 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
             k_c = tl.load(p_mix + H * K + i_h * K + o_kt, mask=mask_kt, other=0).to(tl.float32) * k_rnorm
             p_h0_c = h0 + state_idx * stride_init_state_token + i_hv * V * K + o_v[:, None] * K + o_kt[None, :]
             b_h0_c = tl.load(p_h0_c, mask=mask_v[:, None] & mask_kt[None, :], other=0).to(tl.float32)
-            p_k_c = k_cache + ((state_idx * H + i_h) * MAX_CACHE_LEN + o_c[:, None]) * K + o_kt[None, :]
+            p_k_c = k_cache + state_idx * stride_k_slot + ((i_h * MAX_CACHE_LEN + o_c[:, None]) * K + o_kt[None, :])
             b_k_all_c = tl.load(p_k_c, mask=cache_valid[:, None] & mask_kt[None, :], other=0).to(p_o.dtype.element_ty)
             b_h_c = b_h0_c * b_total_decay + tl.dot(b_d_scaled_tc, b_k_all_c).to(tl.float32)
             b_h_new_c = alpha_val * b_h_c + b_d_cur[:, None] * k_c[None, :]
@@ -149,10 +152,10 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     else:
         # Non-flush: append the current token's update vector d and gate g to the
         # cache (the k chunks were already written inside the loop above).
-        p_cur_d = d_cache + ((state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos) * V + o_v
+        p_cur_d = d_cache + state_idx * stride_d_slot + ((i_hv * MAX_CACHE_LEN + b_write_pos) * V + o_v)
         tl.store(p_cur_d, b_d_cur.to(p_cur_d.dtype.element_ty), mask=mask_v & (b_write_pos < MAX_CACHE_LEN))
         if i_v == 0:
-            p_cur_g = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos
+            p_cur_g = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + b_write_pos
             tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
 
 
@@ -276,6 +279,9 @@ def fused_recurrent_gated_delta_rule_replayssm(
         stride_init_state_token=initial_state.stride(0),
         stride_final_state_token=initial_state.stride(0),
         stride_indices_seq=ssm_state_indices.stride(0),
+        stride_d_slot=d_cache.stride(0),
+        stride_k_slot=k_cache.stride(0),
+        stride_g_slot=g_cache.stride(0),
         H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, BC=BC, NK=nk, BKT=BKT,
         MAX_CACHE_LEN=max_cache_len, SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
