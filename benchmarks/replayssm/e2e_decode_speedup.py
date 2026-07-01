@@ -19,7 +19,7 @@ CUDA-graph capture on the pre-release Blackwell FP4 path); pass
 Examples:
     python e2e_decode_speedup.py --model-id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
     python e2e_decode_speedup.py --model-id Qwen/Qwen3.5-4B --buffer-len 16
-    python e2e_decode_speedup.py --dtype auto --buffer-len 8 \
+    python e2e_decode_speedup.py --dtype auto --buffer-len 16 \
         --model-id nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4   # B300 NVFP4
     python e2e_decode_speedup.py --dtype auto --buffer-len 16 \
         --model-id nvidia/Qwen3.5-122B-A10B-NVFP4   # B300 NVFP4 MoE
@@ -47,8 +47,8 @@ def parse_args():
     p.add_argument("--num-steps", type=int, default=1000)
     p.add_argument("--warmup-steps", type=int, default=128)
     p.add_argument("--repeats", type=int, default=1)
-    p.add_argument("--buffer-len", type=int, default=8,
-                   help="ReplaySSM input-buffer length (8 for Mamba2, 16 for GDN).")
+    p.add_argument("--buffer-len", type=int, default=16,
+                   help="ReplaySSM input-buffer length (16 for Mamba2 and GDN).")
     p.add_argument("--dtype", default="bfloat16",
                    choices=["bfloat16", "float16", "float32", "auto"])
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
