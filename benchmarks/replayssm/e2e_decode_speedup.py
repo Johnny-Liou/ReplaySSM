@@ -27,6 +27,7 @@ Examples:
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -68,6 +69,14 @@ def parse_args():
                    choices=["output_only", "state_and_output"],
                    help="Mamba2 cached route: output_only (cached_bc) or "
                         "state_and_output (cached_dot). GDN models ignore it.")
+    p.add_argument("--mamba-ssm-cache-dtype", default="auto",
+                   choices=["auto", "float32", "float16", "bfloat16"],
+                   help="SSM state dtype (both modes). 'auto' = config-driven; "
+                        "'float32' = fp32 state, 'bfloat16' = s16 state.")
+    p.add_argument("--baseline-ssm-config", default="",
+                   help="Pin the STANDARD baseline's SSM launch config as "
+                        "'bsm,nw' via override_ssm_config (forces the in-process "
+                        "engine so the override reaches the kernel). Empty = off.")
     p.add_argument("--worker", choices=["standard", "replayssm"], default=None,
                    help=argparse.SUPPRESS)
     return p.parse_args()
@@ -80,6 +89,11 @@ def resolve_max_model_len(args) -> int:
 
 
 def run_worker(args):
+    # override_ssm_config is a module global; it only reaches the model if the
+    # engine runs in-process (default V1 spawns a separate EngineCore). Force it.
+    if args.worker == "standard" and args.baseline_ssm_config:
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
     import torch
 
     from vllm import LLM, SamplingParams
@@ -100,6 +114,8 @@ def run_worker(args):
         enforce_eager=False,
         disable_log_stats=True,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        # SSM state dtype (applies to both standard and ReplaySSM).
+        mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
         # Skip the vision tower of multimodal hybrids (Qwen3.5 is a
         # *ForConditionalGeneration model); ignored by text-only Mamba2 models.
         language_model_only=True,
@@ -113,6 +129,15 @@ def run_worker(args):
     if mode == "replayssm":
         llm_kwargs.update(use_replayssm=True, replayssm_buffer_len=args.buffer_len,
                           replayssm_route=args.replayssm_route)  # route ignored by GDN models
+
+    _ssm_cm = None
+    if mode == "standard" and args.baseline_ssm_config:
+        from vllm.model_executor.layers.mamba.ops.mamba_ssm import override_ssm_config
+        _bsm, _nw = (int(x) for x in args.baseline_ssm_config.split(","))
+        _ssm_cm = override_ssm_config((_bsm, _nw))
+        _ssm_cm.__enter__()  # active through LLM() graph capture + decode
+        print(f"[{mode}] override_ssm_config -> (BLOCK_SIZE_M={_bsm}, num_warps={_nw})",
+              flush=True)
 
     llm = LLM(**llm_kwargs)
     prompts = [args.prompt] * args.batch_size
@@ -147,6 +172,8 @@ def run_worker(args):
                     "tok_s": tok_s, "per_step_ms": per_step_ms}
 
     print("RESULT_JSON " + json.dumps(best), flush=True)
+    if _ssm_cm is not None:
+        _ssm_cm.__exit__(None, None, None)
 
 
 def run_one_mode(args, mode) -> dict:
@@ -159,6 +186,8 @@ def run_one_mode(args, mode) -> dict:
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--gdn-prefill-backend", args.gdn_prefill_backend,
         "--replayssm-route", args.replayssm_route,
+        "--mamba-ssm-cache-dtype", args.mamba_ssm_cache_dtype,
+        "--baseline-ssm-config", args.baseline_ssm_config,
     ]
     cmd.append("--disable-flashinfer-autotune" if args.disable_flashinfer_autotune
                else "--no-disable-flashinfer-autotune")
