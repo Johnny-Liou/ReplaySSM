@@ -1113,5 +1113,5 @@ xxhash==3.5.0
     #   evaluate
 yarl==1.17.1
     # via aiohttp
-zipp==3.23.0
+zipp==4.1.0
     # via importlib-metadata
