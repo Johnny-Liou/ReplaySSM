@@ -354,8 +354,9 @@ class MambaStateShapeCalculator:
         ``post_conv_cache=(cache_buf_len, conv_dim_local)`` and
         ``dt_cache=(local_nheads, cache_buf_len)``, where the L = B + max_spec_len
         history window sizes ``cache_buf_len = next_pow2(replayssm_buffer_len + 1 +
-        num_spec)`` and ``conv_dim_local`` matches the post-conv x|B|C width. Must
-        stay in sync with ``MambaMixer2.get_state_shape``.
+        num_spec)`` and ``conv_dim_local`` matches the post-conv x|B width (C is
+        not cached; read fresh from conv_out). Must stay in sync with
+        ``MambaMixer2.get_state_shape``.
         """
         conv_state_shape, temporal_state_shape = cls.mamba2_state_shape(
             tp_world_size=tp_world_size,
@@ -373,7 +374,7 @@ class MambaStateShapeCalculator:
             n_groups, tp_world_size
         )
         conv_dim_local = divide(
-            intermediate_size + 2 * n_groups_ext * state_size, tp_world_size
+            intermediate_size + n_groups_ext * state_size, tp_world_size
         )
         # L = B + max_spec_len history window: physical pow2 buffer next_pow2(L).
         cache_buf_len = 1 << (replayssm_buffer_len + num_spec).bit_length()

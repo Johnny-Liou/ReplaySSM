@@ -100,15 +100,10 @@ def _fused_scatter_precompute_kernel(
         other=0.0,
     )
     cache_base = post_conv_cache_ptr + state_batch_idx * stride_post_conv_cache_b
-    # scatter B / C into circular cache
+    # scatter B (C is not cached; read fresh from conv_out)
     tl.store(
         cache_base + phys_spec[:, None] * stride_post_conv_cache_pos + (b_c0 + offs_n[None, :]) * stride_post_conv_cache_c,
         B_spec,
-        mask=spec_valid[:, None] & nmask[None, :],
-    )
-    tl.store(
-        cache_base + phys_spec[:, None] * stride_post_conv_cache_pos + (c_c0 + offs_n[None, :]) * stride_post_conv_cache_c,
-        C_spec,
         mask=spec_valid[:, None] & nmask[None, :],
     )
 
@@ -202,7 +197,7 @@ def _fused_scatter_precompute_kernel(
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.jit
 def _replayssm_spec_nf_kernel(
-    state_ptr, x_cache_ptr, dt_cache_ptr, B_cache_ptr, C_full_ptr, bc_pre_ptr,
+    state_ptr, x_cache_ptr, dt_cache_ptr, B_cache_ptr, C_src_ptr, bc_pre_ptr,
     D_ptr, z_ptr, dt_bias_ptr, A_ptr, out_ptr, is_flush_flags_ptr, write_pos_ptr,
     post_origin_ptr, state_batch_indices_ptr, query_start_loc_ptr, null_block_id,
     batch, nheads, dim, dstate, max_cache_len, nheads_ngroups_ratio,
@@ -210,7 +205,7 @@ def _replayssm_spec_nf_kernel(
     stride_x_cache_batch, stride_x_cache_head, stride_x_cache_dim, stride_x_cache_pos,
     stride_dt_cache_batch, stride_dt_cache_head, stride_dt_cache_pos,
     stride_B_cache_batch, stride_B_cache_group, stride_B_cache_dstate, stride_B_cache_pos,
-    stride_C_full_batch, stride_C_full_group, stride_C_full_dstate, stride_C_full_pos,
+    stride_C_src_tok, stride_C_src_c,
     stride_bc_pre_batch, stride_bc_pre_group, stride_bc_pre_pos, stride_bc_pre_spec,
     stride_D_head, stride_D_dim, stride_z_tok, stride_z_head, stride_z_dim,
     stride_dt_bias_head, stride_A_head, stride_out_tok, stride_out_head, stride_out_dim,
@@ -250,7 +245,7 @@ def _replayssm_spec_nf_kernel(
     state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
     x_cache_ptr += state_batch_idx * stride_x_cache_batch + pid_h * stride_x_cache_head
     dt_cache_ptr += state_batch_idx * stride_dt_cache_batch + pid_h * stride_dt_cache_head
-    C_full_ptr += state_batch_idx * stride_C_full_batch + (pid_h // nheads_ngroups_ratio) * stride_C_full_group
+    C_src_ptr += bos * stride_C_src_tok + (pid_h // nheads_ngroups_ratio) * dstate * stride_C_src_c
     bc_pre_ptr += pid_b * stride_bc_pre_batch + (pid_h // nheads_ngroups_ratio) * stride_bc_pre_group
     if HAS_D:
         D_ptr += pid_h * stride_D_head
@@ -293,8 +288,8 @@ def _replayssm_spec_nf_kernel(
         offs_n = i * DSTATE_TILE + offs_nt
         nmask = offs_n < dstate
         st = tl.load(state_ptr + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate, mask=(offs_m[:, None] < dim) & nmask[None, :], other=0.0).to(tl.float32)
-        c_mask = spec_valid_mask[:, None] & nmask[None, :] & (spec_cache_pos[:, None] < max_cache_len)
-        c_chunk = tl.load(C_full_ptr + phys_spec[:, None] * stride_C_full_pos + offs_n[None, :] * stride_C_full_dstate, mask=c_mask, other=0.0).to(tl.float32)
+        c_mask = spec_valid_mask[:, None] & nmask[None, :]
+        c_chunk = tl.load(C_src_ptr + offs_s[:, None] * stride_C_src_tok + offs_n[None, :] * stride_C_src_c, mask=c_mask, other=0.0).to(tl.float32)
         if x_cache_ptr.dtype.element_ty == tl.float32:
             checkpoint_out += tl.dot(st, tl.trans(c_chunk), input_precision="tf32x3").to(tl.float32)
         else:
@@ -324,7 +319,7 @@ def _replayssm_spec_nf_kernel(
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.jit
 def _replayssm_spec_fl_kernel(
-    state_ptr, x_cache_ptr, dt_cache_ptr, B_cache_ptr, C_full_ptr, bc_pre_ptr,
+    state_ptr, x_cache_ptr, dt_cache_ptr, B_cache_ptr, C_src_ptr, bc_pre_ptr,
     D_ptr, z_ptr, dt_bias_ptr, A_ptr, out_ptr, is_flush_flags_ptr, write_pos_ptr,
     post_origin_ptr, state_batch_indices_ptr, query_start_loc_ptr, null_block_id,
     batch, nheads, dim, dstate, max_cache_len, nheads_ngroups_ratio,
@@ -332,7 +327,7 @@ def _replayssm_spec_fl_kernel(
     stride_x_cache_batch, stride_x_cache_head, stride_x_cache_dim, stride_x_cache_pos,
     stride_dt_cache_batch, stride_dt_cache_head, stride_dt_cache_pos,
     stride_B_cache_batch, stride_B_cache_group, stride_B_cache_dstate, stride_B_cache_pos,
-    stride_C_full_batch, stride_C_full_group, stride_C_full_dstate, stride_C_full_pos,
+    stride_C_src_tok, stride_C_src_c,
     stride_bc_pre_batch, stride_bc_pre_group, stride_bc_pre_pos, stride_bc_pre_spec,
     stride_D_head, stride_D_dim, stride_z_tok, stride_z_head, stride_z_dim,
     stride_dt_bias_head, stride_A_head, stride_out_tok, stride_out_head, stride_out_dim,
@@ -370,7 +365,7 @@ def _replayssm_spec_fl_kernel(
     x_cache_ptr += state_batch_idx * stride_x_cache_batch + pid_h * stride_x_cache_head
     dt_cache_ptr += state_batch_idx * stride_dt_cache_batch + pid_h * stride_dt_cache_head
     B_cache_ptr += state_batch_idx * stride_B_cache_batch + (pid_h // nheads_ngroups_ratio) * stride_B_cache_group
-    C_full_ptr += state_batch_idx * stride_C_full_batch + (pid_h // nheads_ngroups_ratio) * stride_C_full_group
+    C_src_ptr += bos * stride_C_src_tok + (pid_h // nheads_ngroups_ratio) * dstate * stride_C_src_c
     bc_pre_ptr += pid_b * stride_bc_pre_batch + (pid_h // nheads_ngroups_ratio) * stride_bc_pre_group
     if HAS_D:
         D_ptr += pid_h * stride_D_head
@@ -420,7 +415,7 @@ def _replayssm_spec_fl_kernel(
         if write_pos > 0:
             tl.store(st_ptrs, S1.to(st.dtype), mask=(offs_m[:, None] < dim) & nmask[None, :])
         c_mask = spec_valid_mask[:, None] & nmask[None, :]
-        c_chunk = tl.load(C_full_ptr + phys_spec[:, None] * stride_C_full_pos + offs_n[None, :] * stride_C_full_dstate, mask=c_mask, other=0.0).to(tl.float32)
+        c_chunk = tl.load(C_src_ptr + offs_s[:, None] * stride_C_src_tok + offs_n[None, :] * stride_C_src_c, mask=c_mask, other=0.0).to(tl.float32)
         if x_cache_ptr.dtype.element_ty == tl.float32:
             checkpoint_out += tl.dot(S1, tl.trans(c_chunk), input_precision="tf32x3").to(tl.float32)
         else:
@@ -583,7 +578,8 @@ def selective_state_update_replayssm_spec(
     cache_buf_len = buf
     assert cache_buf_len & (cache_buf_len - 1) == 0, "cache_buf_len must be a power of two"
     assert d_inner == nheads * dim
-    assert post_conv_cache.shape == (num_blocks, buf, conv_dim)
+    cache_conv_dim = d_inner + ngroups * dstate  # x|B only (no C)
+    assert post_conv_cache.shape == (num_blocks, buf, cache_conv_dim)
     assert dt_cache.shape == (num_blocks, nheads, buf)
     assert dt_spec.shape == (total_tokens, nheads)
     assert A.shape == (nheads, dim, dstate) and A.stride(-1) == 0 and A.stride(-2) == 0
@@ -637,20 +633,21 @@ def selective_state_update_replayssm_spec(
     # views into the paged circular post-conv cache: x | B | C on the channel axis
     x_view = post_conv_cache[:, :, :d_inner].view(num_blocks, buf, nheads, dim).permute(0, 2, 1, 3)
     B_view = post_conv_cache[:, :, d_inner : d_inner + ngroups * dstate].view(num_blocks, buf, ngroups, dstate).permute(0, 2, 1, 3)
-    C_view = post_conv_cache[:, :, d_inner + ngroups * dstate :].view(num_blocks, buf, ngroups, dstate).permute(0, 2, 1, 3)
+    # C is not cached; the kernels read it fresh from this conv_out slice.
+    C_src = conv_out[:, d_inner + ngroups * dstate :]
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
 
     def _args(bsm):
         grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
         return grid, (
-            state_checkpoint, x_view, dt_cache, B_view, C_view, bc_pre, D, z, dt_bias, A,
+            state_checkpoint, x_view, dt_cache, B_view, C_src, bc_pre, D, z, dt_bias, A,
             out, is_flush, write_pos, post_conv_state_pos, state_batch_indices,
             query_start_loc, null_block_id, batch, nheads, dim, dstate, L, ratio,
             state_checkpoint.stride(0), state_checkpoint.stride(1), state_checkpoint.stride(2), state_checkpoint.stride(3),
             x_view.stride(0), x_view.stride(1), x_view.stride(3), x_view.stride(2),
             dt_cache.stride(0), dt_cache.stride(1), dt_cache.stride(2),
             B_view.stride(0), B_view.stride(1), B_view.stride(3), B_view.stride(2),
-            C_view.stride(0), C_view.stride(1), C_view.stride(3), C_view.stride(2),
+            C_src.stride(0), C_src.stride(1),
             bc_pre.stride(0), bc_pre.stride(1), bc_pre.stride(2), bc_pre.stride(3),
             D.stride(0) if D is not None else 0, D.stride(1) if D is not None else 0,
             z_strides[0], z_strides[1], z_strides[2], dt_bias.stride(0) if dt_bias is not None else 0,

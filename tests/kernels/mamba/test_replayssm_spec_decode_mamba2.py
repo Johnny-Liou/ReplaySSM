@@ -85,7 +85,6 @@ def _scatter_packed_history(
     slot: int,
     x_hist: torch.Tensor,  # (wp, H, P)
     B_hist: torch.Tensor,  # (wp, G, N)
-    C_hist: torch.Tensor,  # (wp, G, N)
     dt_hist_raw: torch.Tensor,  # (wp, H) raw dt
     d_inner: int,
     ngroups: int,
@@ -93,15 +92,15 @@ def _scatter_packed_history(
 ) -> None:
     """Fill the committed history [0, wp) into the packed circular caches at
     post_origin=0 (so logical pos == physical pos). Channel map matches the
-    kernel's x_view/B_view/C_view: x[h,d]->h*P+d, B[g,n]->d_inner+g*N+n,
-    C[g,n]->d_inner+G*N+g*N+n. dt_cache stores RAW dt (the kernel applies
-    bias+softplus on read)."""
+    kernel's x_view/B_view: x[h,d]->h*P+d, B[g,n]->d_inner+g*N+n (C is not
+    cached; the kernel reads it fresh from conv_out). dt_cache stores RAW dt
+    (the kernel applies bias+softplus on read)."""
     wp, H, P = x_hist.shape
     G, N = ngroups, dstate
     for p in range(wp):
         post_conv_cache[slot, p, :d_inner] = x_hist[p].reshape(d_inner)
         post_conv_cache[slot, p, d_inner : d_inner + G * N] = B_hist[p].reshape(G * N)
-        post_conv_cache[slot, p, d_inner + G * N :] = C_hist[p].reshape(G * N)
+        # C not cached; only x|B seeded.
         dt_cache[slot, :, p] = dt_hist_raw[p].float()
 
 
@@ -237,13 +236,13 @@ def _run_single_step(
 
     # spec path: prefill packed history, one verify call (non-flush).
     state_spec = S0.clone()
-    conv_dim = d_inner + 2 * G * N
+    cache_conv_dim = d_inner + G * N  # x|B only (no C)
     post_conv_cache = torch.zeros(
-        num_blocks, buf, conv_dim, device=DEV, dtype=act_dtype
+        num_blocks, buf, cache_conv_dim, device=DEV, dtype=act_dtype
     )
     dt_cache = torch.zeros(num_blocks, H, buf, device=DEV, dtype=torch.float32)
     _scatter_packed_history(
-        post_conv_cache, dt_cache, 1, x[:wp], B[:wp], C[:wp], dt[:wp], d_inner, G, N
+        post_conv_cache, dt_cache, 1, x[:wp], B[:wp], dt[:wp], d_inner, G, N
     )
     if perturb:
         # teeth: corrupt one history slot -> outputs must diverge from the oracle.
@@ -431,9 +430,9 @@ def _run_rollback(
     state_spec = S0.clone()
     state_base = S0.clone()  # full pool; row in slot 1
 
-    conv_dim = d_inner + 2 * G * N
+    cache_conv_dim = d_inner + G * N  # x|B only (no C)
     post_conv_cache = torch.zeros(
-        num_blocks, buf, conv_dim, device=DEV, dtype=act_dtype
+        num_blocks, buf, cache_conv_dim, device=DEV, dtype=act_dtype
     )
     dt_cache = torch.zeros(num_blocks, H, buf, device=DEV, dtype=torch.float32)
     write_pos = torch.zeros(num_blocks, dtype=torch.int32, device=DEV)
@@ -609,7 +608,7 @@ def test_spec_continuous_batching(precision, with_padding):
     S0 = torch.randn(total_slots, H, P, N, device=DEV, dtype=state_dtype) * 0.1
     state_spec = S0.clone()
     post_conv_cache = torch.zeros(
-        total_slots, buf, conv_dim, device=DEV, dtype=act_dtype
+        total_slots, buf, d_inner + G * N, device=DEV, dtype=act_dtype
     )
     dt_cache = torch.zeros(total_slots, H, buf, device=DEV, dtype=torch.float32)
     write_pos = torch.zeros(total_slots, dtype=torch.int32, device=DEV)
@@ -656,7 +655,6 @@ def test_spec_continuous_batching(precision, with_padding):
             slot,
             x[:wp],
             Bv[:wp],
-            Cv[:wp],
             dt[:wp],
             d_inner,
             G,

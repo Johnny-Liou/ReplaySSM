@@ -114,10 +114,8 @@ def run_worker(args):
         # Avoid the FlashInfer GDN-prefill cutlass-DSL JIT stall on Blackwell
         # (same default as the decode benchmark).
         additional_config={"gdn_prefill_backend": "triton"},
-        # Capture a CUDA graph for the full spec-decode batch (bs * spec_window
-        # tokens per step); otherwise large batches fall back to eager.
         compilation_config={
-            "max_cudagraph_capture_size": args.batch_size * spec_window
+            "max_cudagraph_capture_size": max(8, args.batch_size * spec_window)
         },
     )
     if args.disable_flashinfer_autotune:
