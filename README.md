@@ -1,16 +1,18 @@
 <!-- markdownlint-disable MD001 MD041 -->
 <!-- ===================== ReplaySSM fork ===================== -->
-# ReplaySSM (a vLLM fork)
+# ReplaySSM (a vLLM research fork)
 
-> A fork of [vLLM](https://github.com/vllm-project/vllm) (based on upstream commit
-> [`193ce8812`](https://github.com/vllm-project/vllm/commit/193ce8812)) adding
-> **ReplaySSM**: faster autoregressive **and** speculative decoding for hybrid
-> models (with Mamba2, Gated DeltaNet) by caching recent SSM **inputs** in a
-> small ring buffer instead of writing the recurrent **state** back to HBM every
-> decode step.
+> **ReplaySSM** makes autoregressive **and** speculative decoding faster for hybrid
+> models (Mamba2, Gated DeltaNet) by caching recent SSM **inputs** in a small ring
+> buffer instead of writing the recurrent **state** back to HBM every decode step.
 >
-> 📝 **Blog post:** [ReplaySSM: Cache SSM Inputs, Not State](https://dao-lab.ai/blog/2026/replayssm/) &nbsp;·&nbsp; built on vLLM
-> (Apache-2.0); see the upstream README below for general install and usage.
+> 📝 **Blog post:** [ReplaySSM: Cache SSM Inputs, Not State](https://dao-lab.ai/blog/2026/replayssm/)
+> &nbsp;·&nbsp; 🚀 **Upstreaming to vLLM:** RFC [#47572](https://github.com/vllm-project/vllm/issues/47572), PR [#47576](https://github.com/vllm-project/vllm/pull/47576)
+>
+> This repository is the original research reference, based on vLLM (Apache-2.0) at
+> upstream commit [`37ce34922`](https://github.com/vllm-project/vllm/commit/37ce34922);
+> the productized version is being contributed upstream via the links above. See the
+> upstream vLLM README below for general install and usage.
 
 ## Try it out
 
