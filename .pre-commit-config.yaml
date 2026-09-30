@@ -211,6 +211,7 @@ repos:
     entry: python tools/pre_commit/check_spdx_header.py
     language: python
     types_or: [python, rust, proto]
+    exclude: ^(emulation|low_precision)/
   - id: check-root-lazy-imports
     name: Check root lazy imports
     entry: python tools/pre_commit/check_init_lazy_imports.py
@@ -241,6 +242,7 @@ repos:
     language: python
     types: [python]
     additional_dependencies: [regex]
+    exclude: ^(emulation|low_precision)/
   # prevent use torch.cuda APIs
   - id: check-torch-cuda-call
     name: "Prevent new 'torch.cuda' APIs call"
@@ -248,6 +250,7 @@ repos:
     language: python
     types: [python]
     additional_dependencies: [regex]
+    exclude: ^(emulation|low_precision)/
   - id: validate-config
     name: Validate configuration has default values and that each field has a docstring
     entry: python tools/pre_commit/validate_config.py

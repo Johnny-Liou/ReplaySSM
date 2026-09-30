@@ -986,11 +986,8 @@ def supports_mamba_prefix_caching(
 
 @runtime_checkable
 class SupportsReplaySSM(Protocol):
-    """The interface for models whose Mamba2 layers support ReplaySSM cached
-    standard decode.
-
-    This is currently experimental.
-    """
+    """The interface for models whose SSM layers (Mamba2 or GDN) support
+    ReplaySSM decoding."""
 
     supports_replayssm: ClassVar[Literal[True]] = True
 

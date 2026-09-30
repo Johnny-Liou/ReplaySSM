@@ -6,6 +6,7 @@
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -27,6 +28,7 @@ def mock_model_runner_with_input_batch():
     runner = Mock(spec=GPUModelRunner)
     runner.uses_mrope = False
     runner.requests = {}
+    runner._replayssm_spec_deferred_state = {}
     runner.max_num_reqs = 10
     runner.max_model_len = 1024
     runner.late_interaction_runner = Mock()
@@ -72,6 +74,8 @@ def test_e2e_streaming_request_update_basic_flow(mock_model_runner_with_input_ba
     )
     runner.requests[req_id] = initial_req_state
 
+    runner._replayssm_spec_deferred_state[req_id] = (3, torch.tensor(2))
+
     # Add request to InputBatch
     runner.input_batch.add_request(initial_req_state)
     assert req_id in runner.input_batch.req_id_to_index
@@ -116,6 +120,7 @@ def test_e2e_streaming_request_update_basic_flow(mock_model_runner_with_input_ba
 
     # Verify request was removed from InputBatch during update (avoids duplication)
     assert req_id not in runner.input_batch.req_id_to_index
+    assert req_id not in runner._replayssm_spec_deferred_state
 
 
 def test_e2e_streaming_with_multimodal_features(mock_model_runner_with_input_batch):

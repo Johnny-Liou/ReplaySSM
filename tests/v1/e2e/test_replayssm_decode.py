@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Engine-level parity: ReplaySSM standard decode vs the baseline SSM kernel."""
+"""Engine-level parity for ReplaySSM standard and speculative decoding."""
 
 import pytest
 
@@ -9,10 +9,16 @@ from vllm.v1.metrics.reader import Counter
 from ...models.utils import check_logprobs_close
 from ...utils import large_gpu_mark, multi_gpu_test
 
-# Mamba2 (Nemotron-3) hybrid.
+# Mamba2 (Nemotron-3) and GDN (Qwen3.5) hybrids.
 MAMBA2_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
+GDN_MODEL = "Qwen/Qwen3.5-4B"
 MODELS = [
     pytest.param(MAMBA2_MODEL, marks=large_gpu_mark(min_gb=40)),
+    pytest.param(GDN_MODEL, marks=large_gpu_mark(min_gb=40)),
+]
+SPEC_MODELS = [
+    pytest.param(MAMBA2_MODEL, marks=large_gpu_mark(min_gb=40)),
+    pytest.param(GDN_MODEL, marks=large_gpu_mark(min_gb=40)),
 ]
 
 PROMPTS = [
@@ -53,7 +59,7 @@ def test_replayssm_decode_matches_baseline(vllm_runner, model_name):
 
 
 @multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize("model_name", [MAMBA2_MODEL])
+@pytest.mark.parametrize("model_name", [MAMBA2_MODEL, GDN_MODEL])
 def test_replayssm_decode_matches_baseline_tp2(vllm_runner, model_name):
     # Tensor-parallel correctness: ReplaySSM's caches and checkpoint state are
     # sharded per rank, so TP2 decode must still match the baseline at TP2.
@@ -95,6 +101,9 @@ def _check_replayssm_prefix_caching_parity(
         mamba_cache_mode="align",
         disable_log_stats=False,  # required for llm.get_metrics()
         tensor_parallel_size=tensor_parallel_size,
+        # GDN prefill JIT-compiles under FlashInfer; the backend is irrelevant
+        # to the decode parity measured here and Triton avoids the JIT.
+        additional_config={"gdn_prefill_backend": "triton"},
     )
     with vllm_runner(model_name, **common) as llm:
         baseline = llm.generate_greedy_logprobs(
@@ -136,3 +145,45 @@ def test_replayssm_prefix_caching_matches_baseline_tp2(vllm_runner, model_name):
     _check_replayssm_prefix_caching_parity(
         vllm_runner, model_name, tensor_parallel_size=2
     )
+
+
+def _check_replayssm_spec_parity(
+    vllm_runner, model_name, *, num_spec_tokens=3, async_scheduling=False
+):
+    # Exercise commits, rollback and flushes, allowing near-tie greedy choices
+    # only when they appear in the other path's top log probabilities.
+    common = dict(
+        max_model_len=1024,
+        trust_remote_code=True,
+        enable_prefix_caching=False,
+        mamba_cache_mode="none",
+        async_scheduling=async_scheduling,
+        speculative_config={
+            "method": "ngram_gpu" if async_scheduling else "ngram",
+            "num_speculative_tokens": num_spec_tokens,
+            "prompt_lookup_max": 3,
+        },
+    )
+    with vllm_runner(model_name, **common) as llm:
+        baseline = llm.generate_greedy_logprobs(PROMPTS, max_tokens=32, num_logprobs=5)
+    with vllm_runner(
+        model_name, use_replayssm_spec=True, replayssm_buffer_len=16, **common
+    ) as llm:
+        replay = llm.generate_greedy_logprobs(PROMPTS, max_tokens=32, num_logprobs=5)
+
+    check_logprobs_close(
+        outputs_0_lst=baseline,
+        outputs_1_lst=replay,
+        name_0="baseline_spec",
+        name_1="replayssm_spec",
+    )
+
+
+@pytest.mark.parametrize("model_name", SPEC_MODELS)
+def test_replayssm_spec_decode_matches_baseline(vllm_runner, model_name):
+    _check_replayssm_spec_parity(vllm_runner, model_name)
+
+
+@pytest.mark.parametrize("model_name", SPEC_MODELS)
+def test_replayssm_spec_async_scheduling_matches_baseline(vllm_runner, model_name):
+    _check_replayssm_spec_parity(vllm_runner, model_name, async_scheduling=True)

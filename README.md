@@ -1,110 +1,101 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# ReplaySSM
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+Code for the paper *ReplaySSM: Cache SSM Inputs, Not State* by Ze-Wei Liou,
+Harris Nover, Amey Naik, Andrii Skliar, Igor Shovkun, Ido Shahaf and Tri Dao
+(Princeton University and NVIDIA).
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+ReplaySSM represents an SSM state as a checkpoint and a bounded buffer of recent
+inputs. This separates output computation from checkpoint updates, with three
+benefits:
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+- **Reduced memory traffic:** most decoding steps compute outputs without writing
+  the state. Periodic flushes update the checkpoint, roughly halving the dominant
+  state memory traffic.
+- **Cheap rollback:** speculative decoding discards rejected inputs by moving a
+  buffer pointer. Output-only verification avoids materializing intermediate
+  recurrent states.
+- **Separate state precisions:** non-flush steps use a low-precision checkpoint
+  for output computation, while flushes use a higher-precision checkpoint for
+  recurrent updates. Rounding error in the low-precision copy never enters later
+  recurrent updates.
 
----
+This repository is a vLLM fork with ReplaySSM implementations for Mamba2 and
+Gated DeltaNet (GDN), covering standard and speculative decoding, along with
+standalone precision kernels. Upstream vLLM has merged the Mamba2 standard
+decoding kernel; the other three decoding paths, the emulated quantization and
+the low-precision CuTe kernels are only available here.
 
-## About
+| Code | Location |
+| --- | --- |
+| Mamba2 standard decoding | [Triton kernel](vllm/model_executor/layers/mamba/ops/selective_state_update_replayssm_output_only.py) |
+| Mamba2 speculative decoding | [Triton kernel](vllm/model_executor/layers/mamba/ops/selective_state_update_replayssm_spec.py) |
+| GDN standard decoding | [Triton kernel](vllm/third_party/flash_linear_attention/ops/fused_recurrent_replayssm.py) |
+| GDN speculative decoding | [Triton kernel](vllm/third_party/flash_linear_attention/ops/gdn_replayssm_spec_decode.py) |
+| Emulated quantization | [emulation/](emulation/README.md): nine precision presets, FP32 storage |
+| Low-precision CuTe kernels | [low_precision/](low_precision/README.md): FP16+SR, FP8 and NVFP4 on B300 |
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+The vLLM integration uses `--use-replayssm` for standard decoding and
+`--use-replayssm-spec` alongside a speculative decoding configuration. The flags
+are mutually exclusive. `--replayssm-buffer-len 16` selects the paper's window
+length. Relevant metadata and dispatch live in
+[mamba_attn.py](vllm/v1/attention/backends/mamba_attn.py),
+[gdn_attn.py](vllm/v1/attention/backends/gdn_attn.py), and the
+[Mamba layers](vllm/model_executor/layers/mamba/).
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+The vLLM integration is based on upstream commit
+`ee1d99636702b8ed9ad88c2c2b833d331dce01c1`, with ReplaySSM extensions.
 
-vLLM is fast with:
+Build the serving engine from this checkout using the upstream
+[source-build instructions](docs/getting_started/installation/gpu.cuda.inc.md#full-build).
+Set `VLLM_VERSION_OVERRIDE=0.23.1+replayssm` when installing this snapshot without
+upstream Git tags. The original project overview is retained in
+[README.vllm.md](README.vllm.md). The two precision folders have separate setup
+instructions and do not require a vLLM build.
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+The [emulation kernels](emulation/README.md) implement separate read and recurrence
+precision and expose their quantization behavior. The [CuTe kernels](low_precision/README.md)
+support the latency benefit of reading the checkpoint in low precision on B300.
+Both folders include focused correctness tests and usage instructions.
 
-vLLM is flexible and easy to use with:
+## Benchmarks
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+[e2e_decode_speedup.py](benchmarks/replayssm/e2e_decode_speedup.py) times standard
+decoding with the conventional kernel and with ReplaySSM.
+[e2e_spec_decode_throughput.py](benchmarks/replayssm/e2e_spec_decode_throughput.py)
+compares speculative decoding throughput against standard decoding and vLLM's
+native speculative decoding.
 
 ```bash
-uv pip install vllm
+python benchmarks/replayssm/e2e_decode_speedup.py --model-id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+python benchmarks/replayssm/e2e_decode_speedup.py --model-id Qwen/Qwen3.5-4B
+python benchmarks/replayssm/e2e_spec_decode_throughput.py --batch-size 512 \
+    --model-id nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+## Adoption
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+ReplaySSM is used in production models. [GLM-5.3-Flash](https://z.ai/blog/glm-5.3-flash)
+runs it in its serving stack, and the Z.ai
+[infrastructure report](https://z.ai/blog/glm-built-its-inference-infrastructure)
+describes adding it to the KDA decode kernel.
+[Kimi-K3](https://arxiv.org/pdf/2607.24653) (Section 5.4.2) caches the projected
+draft inputs for MTP verification in its KDA layers and cites ReplaySSM as a
+concurrent approach.
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+The authors of the paper wrote the
+[Dao AI Lab blog post](https://dao-lab.ai/blog/2026/replayssm/) and contributed
+implementations to the serving systems below. The row marked "NVIDIA" was
+contributed independently.
 
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+| System | Scope | Link | Status | By |
+| --- | --- | --- | --- | --- |
+| TensorRT-LLM | Mamba2 MTP, checkpointing replay | [#14203](https://github.com/NVIDIA/TensorRT-LLM/pull/14203) | merged | paper authors |
+| vLLM | Mamba2 standard decoding | [#48018](https://github.com/vllm-project/vllm/pull/48018) | merged | paper authors |
+| vLLM | GDN standard decoding, Mamba2 and GDN speculative decoding | [#48792](https://github.com/vllm-project/vllm/pull/48792), [#49847](https://github.com/vllm-project/vllm/pull/49847), [#49887](https://github.com/vllm-project/vllm/pull/49887) | open | paper authors |
+| FlashInfer | Mamba2 checkpointing, MTP | [#3975](https://github.com/flashinfer-ai/flashinfer/pull/3975) | merged | paper authors |
+| FlashInfer | GDN speculative decoding, u/d cache | [#4081](https://github.com/flashinfer-ai/flashinfer/pull/4081) | merged | paper authors |
+| FlashInfer | GDN speculative decoding, v cache | [#4140](https://github.com/flashinfer-ai/flashinfer/pull/4140) | open | paper authors |
+| FlashInfer | Materialization for prefix caching | [#4815](https://github.com/flashinfer-ai/flashinfer/pull/4815) | merged | paper authors |
+| TensorRT-LLM | GDN MTP replay | [#16464](https://github.com/NVIDIA/TensorRT-LLM/pull/16464) | merged | NVIDIA |
 
 ## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)

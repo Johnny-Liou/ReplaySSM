@@ -647,6 +647,182 @@ def test_update_states_request_unscheduled(model_runner, dist_init):
     assert not _is_req_scheduled(model_runner, req_ids[1])
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("family", ["mamba2", "gdn"])
+def test_replayssm_request_unscheduled_preserves_deferred_state(
+    model_runner, dist_init, async_scheduling, family
+):
+    """A paused request commits its pending tokens after moving to another row."""
+    req_ids = ("req_0", "req_1")
+    model_runner.use_async_scheduling = async_scheduling
+    model_runner.use_async_spec_decode = async_scheduling
+    model_runner.cache_config.use_replayssm_spec = True
+    model_runner.input_batch.use_replayssm = True
+    model_runner._update_states(_schedule_new_request(*req_ids))
+
+    req_id = req_ids[1]
+    req_index = model_runner.input_batch.req_id_to_index[req_id]
+    model_runner.requests[req_id].output_token_ids.append(99)
+    model_runner.input_batch.num_computed_tokens_cpu[req_index] = 4
+    model_runner.input_batch.replayssm_decode_base[req_index] = 3
+    model_runner.num_accepted_tokens.gpu[req_index] = 3
+    accepted_tokens_event = Mock()
+    model_runner.num_accepted_tokens_event = accepted_tokens_event
+
+    model_runner._update_states(
+        SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={req_ids[0]: 1},
+            total_num_scheduled_tokens=1,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+        )
+    )
+
+    decode_base, deferred = model_runner._replayssm_spec_deferred_state[req_id]
+    assert decode_base == 3
+    assert deferred.item() == 3
+    accepted_tokens_event.synchronize.assert_not_called()
+    model_runner.num_accepted_tokens.gpu.fill_(7)
+    model_runner.input_batch.prev_req_id_to_index = {req_ids[0]: 0}
+    if async_scheduling:
+        model_runner.valid_sampled_token_count_gpu = torch.ones(
+            model_runner.max_num_reqs, device=DEVICE_TYPE, dtype=torch.int32
+        )
+
+    resume_output = _schedule_cached_requests(
+        req_ids=[req_id],
+        num_scheduled_tokens={req_id: 1},
+        new_token_ids=[[]],
+        num_computed_tokens=[4],
+        num_output_tokens=[1],
+    )
+    resume_output.scheduled_cached_reqs.all_token_ids[req_id] = [1, 2, 3, 99]
+    model_runner._update_states(resume_output)
+
+    req_index = model_runner.input_batch.req_id_to_index[req_id]
+    assert req_index == 0
+    model_runner._prepare_inputs(resume_output, np.array([1], dtype=np.int32))
+    assert model_runner.input_batch.replayssm_decode_base[req_index] == 3
+    assert model_runner.num_accepted_tokens.gpu[req_index].item() == 3
+    assert req_id not in model_runner._replayssm_spec_deferred_state
+
+    if family == "mamba2":
+        from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_spec import (  # noqa: E501
+            commit_replayssm_spec as commit,
+        )
+    else:
+        from vllm.third_party.flash_linear_attention.ops.gdn_replayssm_spec_decode import (  # noqa: E501
+            commit_gdn_replayssm_spec as commit,
+        )
+    write_pos = torch.tensor([0, 2], dtype=torch.int32, device=DEVICE_TYPE)
+    origin = torch.zeros_like(write_pos)
+    is_flush = torch.zeros(2, dtype=torch.int8, device=DEVICE_TYPE)
+    commit(
+        write_pos,
+        origin,
+        is_flush,
+        model_runner.num_accepted_tokens.gpu[req_index : req_index + 1],
+        torch.tensor([1], dtype=torch.int32, device=DEVICE_TYPE),
+        max_cache_len=20,
+        max_spec_len=4,
+        cache_buf_len=32,
+    )
+    assert write_pos[1].item() == 5
+
+
+@pytest.mark.parametrize("disposal", ["preempted", "finished", "resumed"])
+def test_replayssm_cache_replacement_discards_deferred_state(
+    model_runner, dist_init, disposal
+):
+    """Pending state must not survive termination or cache-block replacement."""
+    req_id = "req_0"
+    model_runner.use_async_scheduling = False
+    model_runner.cache_config.use_replayssm_spec = True
+    model_runner.input_batch.use_replayssm = True
+    model_runner._update_states(_schedule_new_request(req_id))
+
+    req_index = model_runner.input_batch.req_id_to_index[req_id]
+    model_runner.input_batch.replayssm_decode_base[req_index] = 3
+    model_runner.num_accepted_tokens.gpu[req_index] = 3
+    model_runner._update_states(
+        SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+        )
+    )
+
+    decode_base, deferred = model_runner._replayssm_spec_deferred_state[req_id]
+    assert decode_base == 3
+    assert deferred.item() == 3
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        preempted_req_ids={req_id} if disposal == "preempted" else None,
+    )
+    if disposal == "finished":
+        scheduler_output.finished_req_ids = {req_id}
+    elif disposal == "resumed":
+        scheduler_output = _schedule_cached_requests(
+            req_ids=[req_id],
+            num_scheduled_tokens={req_id: 1},
+            new_token_ids=[[]],
+            num_computed_tokens=[3],
+            num_output_tokens=[0],
+        )
+        scheduler_output.scheduled_cached_reqs.resumed_req_ids = {req_id}
+        scheduler_output.scheduled_cached_reqs.new_block_ids = [([2],)]
+    model_runner._update_states(scheduler_output)
+
+    assert req_id not in model_runner._replayssm_spec_deferred_state
+
+
+@pytest.mark.parametrize("use_replayssm_spec", [False, True])
+def test_async_metadata_retains_replayssm_reset_counts(
+    model_runner, dist_init, monkeypatch, use_replayssm_spec
+):
+    """ReplaySSM can detect decode entry while GPU token counts stay authoritative."""
+    model_runner.use_async_spec_decode = True
+    model_runner.cache_config.use_replayssm_spec = use_replayssm_spec
+    model_runner.input_batch.use_replayssm = use_replayssm_spec
+    model_runner.initialize_metadata_builders(
+        model_runner.kv_cache_config, [BLOCK_SIZE]
+    )
+    scheduler_output = _schedule_new_request("req_0")
+    model_runner._update_states(scheduler_output)
+    model_runner._prepare_inputs(scheduler_output, np.array([3], dtype=np.int32))
+    constructor = Mock(wraps=gpu_model_runner_module.CommonAttentionMetadata)
+    monkeypatch.setattr(gpu_model_runner_module, "CommonAttentionMetadata", constructor)
+    model_runner._build_attention_metadata(
+        num_tokens=3,
+        num_reqs=1,
+        max_query_len=3,
+        slot_mappings={0: model_runner.input_batch.block_table[0].slot_mapping.gpu[:3]},
+    )
+    kwargs = constructor.call_args.kwargs
+    assert (kwargs["_num_computed_tokens_cpu"] is not None) == use_replayssm_spec
+    assert kwargs["_seq_lens_cpu"] is None
+
+
 def test_update_states_pp_non_async_multi_request_keeps_token_buffers_consistent(
     model_runner, model_runner_2, dist_init, monkeypatch
 ):
