@@ -1,8 +1,18 @@
 # ReplaySSM
 
-Code for the paper *ReplaySSM: Cache SSM Inputs, Not State* by Ze-Wei Liou,
-Harris Nover, Amey Naik, Andrii Skliar, Igor Shovkun, Ido Shahaf and Tri Dao
-(Princeton University and NVIDIA).
+Code for the paper [*ReplaySSM: Cache SSM Inputs, Not State*](https://arxiv.org/abs/2610.13778)
+by Ze-Wei Liou, Harris Nover, Amey Naik, Andrii Skliar, Igor Shovkun, Ido Shahaf
+and Tri Dao (Princeton University and NVIDIA).
+
+[arXiv](https://arxiv.org/abs/2610.13778) ·
+[NVIDIA Technical Blog](https://developer.nvidia.com/blog/replayssm-rethinking-state-storage-for-faster-hybrid-model-decoding/) ·
+[Dao AI Lab blog](https://dao-lab.ai/blog/2026/replayssm/)
+
+The NVIDIA post summarizes the paper and its deployments, and the earlier Dao AI
+Lab post gives a longer walkthrough of standard and speculative decoding.
+
+ReplaySSM runs in production in GLM-5.3-Flash and Kimi-K3 and is integrated in
+TensorRT-LLM, vLLM, SGLang and FlashInfer. See [Adoption](#adoption) for details.
 
 ReplaySSM represents an SSM state as a checkpoint and a bounded buffer of recent
 inputs. This separates output computation from checkpoint updates, with three
@@ -22,8 +32,9 @@ benefits:
 This repository is a vLLM fork with ReplaySSM implementations for Mamba2 and
 Gated DeltaNet (GDN), covering standard and speculative decoding, along with
 standalone precision kernels. Upstream vLLM has merged the Mamba2 standard
-decoding kernel; the other three decoding paths, the emulated quantization and
-the low-precision CuTe kernels are only available here.
+decoding kernel, and its FlashInfer backend covers Mamba2 standard and
+speculative decoding. The remaining Triton kernels, the emulated quantization
+and the low-precision CuTe kernels are only available here.
 
 | Code | Location |
 | --- | --- |
@@ -82,20 +93,42 @@ describes adding it to the KDA decode kernel.
 draft inputs for MTP verification in its KDA layers and cites ReplaySSM as a
 concurrent approach.
 
-The authors of the paper wrote the
-[Dao AI Lab blog post](https://dao-lab.ai/blog/2026/replayssm/) and contributed
-implementations to the serving systems below. The row marked "NVIDIA" was
-contributed independently.
+ReplaySSM is also integrated in TensorRT-LLM, vLLM, SGLang and FlashInfer, as
+summarized in the
+[NVIDIA Technical Blog post](https://developer.nvidia.com/blog/replayssm-rethinking-state-storage-for-faster-hybrid-model-decoding/).
+The paper authors contributed the merged pull requests below, except the row
+marked "NVIDIA", which was contributed independently.
 
-| System | Scope | Link | Status | By |
-| --- | --- | --- | --- | --- |
-| TensorRT-LLM | Mamba2 MTP, checkpointing replay | [#14203](https://github.com/NVIDIA/TensorRT-LLM/pull/14203) | merged | paper authors |
-| vLLM | Mamba2 standard decoding | [#48018](https://github.com/vllm-project/vllm/pull/48018) | merged | paper authors |
-| vLLM | GDN standard decoding, Mamba2 and GDN speculative decoding | [#48792](https://github.com/vllm-project/vllm/pull/48792), [#49847](https://github.com/vllm-project/vllm/pull/49847), [#49887](https://github.com/vllm-project/vllm/pull/49887) | open | paper authors |
-| FlashInfer | Mamba2 checkpointing, MTP | [#3975](https://github.com/flashinfer-ai/flashinfer/pull/3975) | merged | paper authors |
-| FlashInfer | GDN speculative decoding, u/d cache | [#4081](https://github.com/flashinfer-ai/flashinfer/pull/4081) | merged | paper authors |
-| FlashInfer | GDN speculative decoding, v cache | [#4140](https://github.com/flashinfer-ai/flashinfer/pull/4140) | open | paper authors |
-| FlashInfer | Materialization for prefix caching | [#4815](https://github.com/flashinfer-ai/flashinfer/pull/4815) | merged | paper authors |
-| TensorRT-LLM | GDN MTP replay | [#16464](https://github.com/NVIDIA/TensorRT-LLM/pull/16464) | merged | NVIDIA |
+| System | Scope | Link | By |
+| --- | --- | --- | --- |
+| TensorRT-LLM | Mamba2 MTP, checkpointing replay | [#14203](https://github.com/NVIDIA/TensorRT-LLM/pull/14203) | paper authors |
+| TensorRT-LLM | GDN MTP replay | [#16464](https://github.com/NVIDIA/TensorRT-LLM/pull/16464) | NVIDIA |
+| vLLM | Mamba2 standard decoding | [#48018](https://github.com/vllm-project/vllm/pull/48018) | paper authors |
+| vLLM | FlashInfer backend, Mamba2 standard decoding and MTP | [#52506](https://github.com/vllm-project/vllm/pull/52506), [#52928](https://github.com/vllm-project/vllm/pull/52928) | paper authors |
+| FlashInfer | Mamba2 checkpointing, MTP | [#3975](https://github.com/flashinfer-ai/flashinfer/pull/3975) | paper authors |
+| FlashInfer | GDN speculative decoding, u/d cache | [#4081](https://github.com/flashinfer-ai/flashinfer/pull/4081) | paper authors |
+| FlashInfer | Materialization for prefix caching | [#4815](https://github.com/flashinfer-ai/flashinfer/pull/4815) | paper authors |
+
+Pull requests in progress: FlashInfer
+[#4140](https://github.com/flashinfer-ai/flashinfer/pull/4140) and
+[#6274](https://github.com/flashinfer-ai/flashinfer/pull/6274);
+vLLM
+[#48792](https://github.com/vllm-project/vllm/pull/48792),
+[#49847](https://github.com/vllm-project/vllm/pull/49847) and
+[#49887](https://github.com/vllm-project/vllm/pull/49887)
 
 ## Citation
+
+If you use ReplaySSM in your work, please cite:
+
+```bibtex
+@misc{liou2026replayssmcachessminputs,
+      title={ReplaySSM: Cache SSM Inputs, Not State},
+      author={Ze-Wei Liou and Harris Nover and Amey Naik and Andrii Skliar and Igor Shovkun and Ido Shahaf and Tri Dao},
+      year={2026},
+      eprint={2610.13778},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2610.13778},
+}
+```
